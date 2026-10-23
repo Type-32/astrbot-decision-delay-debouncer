@@ -98,6 +98,13 @@ JEV 超时、缺少密钥、HTTP 错误或返回值非法时，直接提交已�
 两者相互独立；前者设为 0 时不自动发送。`jev_base_url` 支持 `/v1` 基地址或完整的
 `/v1/systemone` 地址，不是 Chat Completions 接口。修改后端、模型或密钥后需重载插件。
 
+### 使用 OpenRouter JEV
+
+设置 `jev_base_url` 为 `https://openrouter.ai/api/v1`，`jev_model` 为
+`typesafe/jev-1.14`，`jev_api_key` 填 OpenRouter 密钥，然后重载插件。
+文本与图片均支持；插件会将 OpenRouter 图片内嵌到 `state.images` 的 `image_url` 中，
+与完整文字上下文一起发送。OpenRouter 会忽略原生 `assets`，因此自动使用此格式。
+
 ### 图片与图文消息
 
 JEV 后端默认启用 `jev_enable_images`，纯图片也会参与完整性判断。
@@ -106,7 +113,7 @@ JEV 后端默认启用 `jev_enable_images`，纯图片也会参与完整性判�
 `jev_max_images` 默认 4（范围 1–8），限制单次传给 JEV 的最近图片数量，
 不会删除传给回复模型的其他图片。关闭图片判断时，纯图片直接交给回复模型，图文仅按文字判断。
 
-使用[原生实验性图片接口](https://docs.typesafe.ai/images)的 `assets` 和
+TypeSafe 官方及原生中转使用[原生实验性图片接口](https://docs.typesafe.ai/images)的 `assets` 和
 `TypeSafe-Danger-Zone-Images: true` 请求头。图片会校正方向、取动画首帧、
 转换 JPEG 并缩放/留白至官方尺寸范围，原图不变。中转服务必须支持这些字段和请求头。
 图片读取失败或接口拒绝图片时，直接提交已合并的原始图片和文字。
