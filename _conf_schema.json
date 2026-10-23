@@ -1,40 +1,97 @@
 {
-    "model_type": {
-        "type": "string",
-        "description": "选择使用的模型类型",
-        "options": ["small", "normal"],
-        "default": "small",
-        "hint": "small: 轻量模型，速度快 | normal: 标准模型，准确度更高"
-    },
-    "send_threshold": {
-        "type": "float",
-        "description": "判断句子完整的概率阈值",
-        "default": 0.8,
-        "hint": "取值范围 0-1，越高则越严格（需要更高的完整概率才会发送）"
-    },
-    "timeout_seconds": {
-        "type": "int",
-        "description": "消息缓存超时时间（秒）",
-        "default": 10,
-        "hint": "超过此时间后，即使句子未完整也会自动发送。设为 0 表示不超时"
-    },
-    "enabled": {
-        "type": "bool",
-        "description": "是否启用消息防抖功能",
-        "default": true,
-        "hint": "关闭后插件将不拦截任何消息"
-    },
-    "usage_scope": {
-        "type": "string",
-        "description": "使用场景",
-        "options": ["both", "group", "private"],
-        "default": "both",
-        "hint": "both: 群聊和私聊都使用 | group: 仅群聊使用 | private: 仅私聊使用"
-    },
-    "cancel_on_new_message": {
-        "type": "bool",
-        "description": "LLM 回复前收到新消息时取消回复",
-        "default": true,
-        "hint": "开启后，若用户在等待 LLM 回复时又发送消息，会取消当前回复并合并新消息"
+  "classifier_backend": {
+    "type": "string",
+    "description": "判断后端",
+    "default": "onnx",
+    "options": [
+      "onnx",
+      "jev"
+    ]
+  },
+  "jev_api_key": {
+    "type": "string",
+    "description": "TypeSafe JEV API Key",
+    "default": "",
+    "hint": "填写 TypeSafe 或兼容中转服务的密钥；留空时读取 TYPESAFE_API_KEY。",
+    "obvious_hint": true
+  },
+  "jev_base_url": {
+    "type": "string",
+    "description": "JEV API 地址",
+    "default": "https://api.typesafe.ai/v1",
+    "hint": "原生 System One API 的 /v1 基地址，也支持完整 /v1/systemone 地址；不是 chat/completions 接口。"
+  },
+  "jev_model": {
+    "type": "string",
+    "description": "JEV 模型",
+    "default": "jev-latest"
+  },
+  "jev_timeout_seconds": {
+    "type": "float",
+    "description": "JEV 请求超时（秒）",
+    "default": 10,
+    "hint": "范围 (0,120]；失败时心流跳过主动回复，防抖直接提交已缓存消息。"
+  },
+  "model_type": {
+    "type": "string",
+    "description": "选择使用的模型类型",
+    "options": [
+      "small",
+      "normal"
+    ],
+    "default": "small",
+    "hint": "small: 轻量模型，速度快 | normal: 标准模型，准确度更高"
+  },
+  "send_threshold": {
+    "type": "float",
+    "description": "判断句子完整的概率阈值",
+    "default": 0.8,
+    "hint": "取值范围 0-1，越高则越严格（需要更高的完整概率才会发送）"
+  },
+  "timeout_seconds": {
+    "type": "int",
+    "description": "消息缓存超时时间（秒）",
+    "default": 10,
+    "hint": "超过此时间后，即使句子未完整也会自动发送。设为 0 表示不超时"
+  },
+  "enabled": {
+    "type": "bool",
+    "description": "是否启用消息防抖功能",
+    "default": true,
+    "hint": "关闭后插件将不拦截任何消息"
+  },
+  "usage_scope": {
+    "type": "string",
+    "description": "使用场景",
+    "options": [
+      "both",
+      "group",
+      "private"
+    ],
+    "default": "both",
+    "hint": "both: 群聊和私聊都使用 | group: 仅群聊使用 | private: 仅私聊使用"
+  },
+  "cancel_on_new_message": {
+    "type": "bool",
+    "description": "LLM 回复前收到新消息时取消回复",
+    "default": true,
+    "hint": "开启后，若用户在等待 LLM 回复时又发送消息，会取消当前回复并合并新消息"
+  },
+  "jev_enable_images": {
+    "type": "bool",
+    "description": "启用 JEV 图片判断",
+    "default": true,
+    "hint": "使用原生实验性图片接口。中转服务需支持 assets 和 TypeSafe-Danger-Zone-Images 请求头。"
+  },
+  "jev_max_images": {
+    "type": "int",
+    "description": "JEV 单次最多判断图片数",
+    "default": 4,
+    "hint": "范围 1-8，超出时判断最近的图片；防抖仍保留全部图片供回复模型使用。",
+    "slider": {
+      "min": 1,
+      "max": 8,
+      "step": 1
     }
+  }
 }

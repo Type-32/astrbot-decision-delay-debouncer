@@ -68,11 +68,54 @@ git clone https://github.com/yourusername/astrbot_plugin_debounce.git
 
 ## ⚙️ 配置说明
 
+### 使用 TypeSafe JEV
+
+将 `classifier_backend` 切换为 `jev`，填写 `jev_api_key`，然后重载插件。
+也可将密钥放在 AstrBot 进程的环境变量 `TYPESAFE_API_KEY` 中，配置中的密钥优先。
+
+```json
+{
+  "enabled": true,
+  "classifier_backend": "jev",
+  "jev_api_key": "你的 TypeSafe API Key",
+  "jev_base_url": "https://api.typesafe.ai/v1",
+  "jev_model": "jev-latest",
+  "jev_timeout_seconds": 10,
+  "send_threshold": 0.8,
+  "timeout_seconds": 10
+}
+```
+
+使用[官方 System One 接口](https://docs.typesafe.ai/api/system-one)的 `Noul`
+问题获取“用户是否已表达完整”的概率，与 `send_threshold` 比较。
+连续收到多条片段时会重新判断合并后的完整文本，不会因为已收到两条就直接提交。
+JEV 模式不加载 ONNX、Tokenizer，也不下载 ModelScope 模型；仅需 AstrBot 自带的
+`aiohttp` 即可运行。`requirements.txt` 仍保留原有 ONNX 后端的依赖，常规安装会安装这些依赖。
+默认后端仍为 `onnx`，`model_type` 仅对 ONNX 生效。
+
+JEV 超时、缺少密钥、HTTP 错误或返回值非法时，直接提交已合并的消息，避免缓存丢失或阻塞回复。
+`timeout_seconds` 是等待用户后续消息的时长，`jev_timeout_seconds` 是单次远程判断的超时，
+两者相互独立；前者设为 0 时不自动发送。`jev_base_url` 支持 `/v1` 基地址或完整的
+`/v1/systemone` 地址，不是 Chat Completions 接口。修改后端、模型或密钥后需重载插件。
+
+### 图片与图文消息
+
+JEV 后端默认启用 `jev_enable_images`，纯图片也会参与完整性判断。
+连续图文消息合并时，JEV 会结合缓存中的图片与文字判断；传给回复模型的
+`image_urls` 会保留各条消息的图片，超时补发也会保留早先消息的图片。
+`jev_max_images` 默认 4（范围 1–8），限制单次传给 JEV 的最近图片数量，
+不会删除传给回复模型的其他图片。关闭图片判断时，纯图片直接交给回复模型，图文仅按文字判断。
+
+使用[原生实验性图片接口](https://docs.typesafe.ai/images)的 `assets` 和
+`TypeSafe-Danger-Zone-Images: true` 请求头。图片会校正方向、取动画首帧、
+转换 JPEG 并缩放/留白至官方尺寸范围，原图不变。中转服务必须支持这些字段和请求头。
+图片读取失败或接口拒绝图片时，直接提交已合并的原始图片和文字。
+
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `model_type` | 选择 | `small` | 模型类型：`small`（轻量快速）/ `normal`（精准度高） |
-| `send_threshold` | 浮点 | `0.5` | 完整性判断阈值（0-1），越高越严格 |
-| `timeout_seconds` | 整数 | `30` | 超时自动发送时间（秒），设为 0 禁用 |
+| `send_threshold` | 浮点 | `0.8` | 完整性判断阈值（0-1），越高越严格 |
+| `timeout_seconds` | 整数 | `10` | 超时自动发送时间（秒），设为 0 禁用 |
 | `enabled` | 布尔 | `true` | 是否启用插件 |
 | `cancel_on_new_message` | 布尔 | `true` | LLM 回复前收到新消息时取消回复 |
 | `debug_mode` | 布尔 | `false` | 调试模式，输出详细日志 |
