@@ -49,12 +49,8 @@ def number(value, minimum: float, maximum: float) -> float:
 
 class JevClient:
     def __init__(self, config):
-        self.api_key = (
-            str(config.get("jev_api_key", "") or "").strip()
-            or os.getenv("TYPESAFE_API_KEY", "").strip()
-        )
         base_url = (
-            str(config.get("jev_base_url", "") or "https://api.typesafe.ai/v1")
+            str(config.get("jev_base_url", "") or "https://openrouter.ai/api/v1")
             .strip()
             .rstrip("/")
         )
@@ -62,6 +58,13 @@ class JevClient:
             base_url if base_url.endswith("/systemone") else base_url + "/systemone"
         )
         self.inline_images = urlsplit(self.endpoint).hostname == "openrouter.ai"
+        # Never send one provider's key to the other.
+        env_key = "OPENROUTER_API_KEY" if self.inline_images else "TYPESAFE_API_KEY"
+        self.api_key = (
+            str(config.get("jev_api_key", "") or "").strip()
+            or os.getenv(env_key, "").strip()
+        )
+        # OpenRouter maps bare System One IDs such as jev-latest onto typesafe/.
         self.model = str(config.get("jev_model", "") or "jev-latest").strip()
         self.enable_images = bool(config.get("jev_enable_images", True))
         try:
@@ -80,13 +83,13 @@ class JevClient:
         self, state, questions: dict, *, images: list | None = None
     ) -> dict:
         if not self.api_key:
-            raise ValueError("Configure jev_api_key or TYPESAFE_API_KEY")
+            raise ValueError("Configure jev_api_key")
         return await asyncio.wait_for(
             self._evaluate(state, questions, images), timeout=self.timeout
         )
 
     async def _evaluate(self, state, questions: dict, images: list | None) -> dict:
-        # AstrBot already uses aiohttp; keep ONNX/LLM-only imports independent.
+        # AstrBot already ships aiohttp.
         import aiohttp
 
         payload = {"model": self.model, "state": state, "questions": questions}

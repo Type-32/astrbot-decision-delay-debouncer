@@ -1,7 +1,6 @@
 import asyncio
 import importlib.util
 import sys
-import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -33,9 +32,6 @@ def load_plugin():
 
     star.Star = Star
     star.Context = object
-    star.StarTools = types.SimpleNamespace(
-        get_data_dir=lambda: Path(tempfile.gettempdir())
-    )
     event = modules["astrbot.api.event"]
     event.AstrMessageEvent = object
 
@@ -139,14 +135,12 @@ class BurstTests(unittest.IsolatedAsyncioTestCase):
         }
         self.plugin = debounce.DebouncePlugin(None, self.config)
         self.judge = AsyncMock(return_value=1.0)
-        self.plugin._predict_score = self.judge
-        self.plugin.classifier = object()
+        self.plugin._judge = self.judge
 
     async def asyncTearDown(self):
         await self.plugin.terminate()
 
     def use_judge(self, *scores):
-        self.config["classifier_backend"] = "jev"
         self.judge.side_effect = list(scores)
 
     def lead(self, event):
@@ -200,7 +194,7 @@ class BurstTests(unittest.IsolatedAsyncioTestCase):
         await self.follow(Event("我们去爬山吧"))
         await task
         self.assertEqual(first.message_str, "如果明天\n我们去爬山吧")
-        self.assertEqual(self.judge.await_args.args[0], "如果明天\n我们去爬山吧")
+        self.assertEqual(self.judge.await_args.args[0].texts, ["如果明天", "我们去爬山吧"])
 
     async def test_max_wait_releases_incomplete_burst(self):
         self.use_judge(0.1)
@@ -219,13 +213,12 @@ class BurstTests(unittest.IsolatedAsyncioTestCase):
     async def test_message_during_judgment_rejudges_merged_text(self):
         started, release = asyncio.Event(), asyncio.Event()
 
-        async def slow(text, images):
+        async def slow(burst):
             if self.judge.await_count == 1:
                 started.set()
                 await release.wait()
             return 0.99
 
-        self.config["classifier_backend"] = "jev"
         self.judge.side_effect = slow
         first = Event("如果明天")
         task = self.lead(first)
@@ -235,18 +228,6 @@ class BurstTests(unittest.IsolatedAsyncioTestCase):
         await task
         self.assertEqual(self.judge.await_count, 2)
         self.assertEqual(first.message_str, "如果明天\n不下雨")
-
-    async def test_judge_failure_sends(self):
-        self.config["classifier_backend"] = "jev"
-        self.plugin._predict_score = debounce.DebouncePlugin._predict_score.__get__(
-            self.plugin
-        )
-        self.plugin.classifier = types.SimpleNamespace(
-            predict=AsyncMock(side_effect=ValueError("down"))
-        )
-        event = Event("hello")
-        await asyncio.wait_for(self.lead(event), 1)
-        self.assertFalse(event.stopped)
 
     async def test_stopped_leader_drops_burst(self):
         first = Event("hello")
@@ -361,61 +342,66 @@ class BurstTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.plugin.bursts, {})
 
 
-class JevBackendTests(unittest.IsolatedAsyncioTestCase):
+class JevJudgeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.plugin = debounce.DebouncePlugin(
-            None, {"classifier_backend": "jev", "delay_seconds": 0}
+            None, {"jev_api_key": "test-only-key", "delay_seconds": 0}
         )
-        await self.plugin._load_classifier_async()
+        self.evaluate = self.plugin.jev.evaluate = AsyncMock()
 
     async def asyncTearDown(self):
         await self.plugin.terminate()
 
-    async def test_jev_loading_does_not_load_or_download_onnx(self):
-        self.plugin.classifier = None
-        self.plugin._download_model_from_modelscope = AsyncMock(
-            side_effect=AssertionError
-        )
-        with patch.dict(
-            sys.modules,
-            {
-                name: None
-                for name in ["onnxruntime", "transformers", "numpy", "modelscope"]
-            },
-        ):
-            await self.plugin._load_classifier_async()
-        self.assertIsInstance(self.plugin.classifier, debounce.JevSentenceClassifier)
-        self.plugin._download_model_from_modelscope.assert_not_called()
+    async def judge(self, text):
+        event = Event(text)
+        await asyncio.wait_for(self.plugin.on_waiting_llm_request(event), 1)
+        return event
+
+    def test_defaults_to_openrouter(self):
+        client = self.plugin.jev
+        self.assertEqual(client.endpoint, "https://openrouter.ai/api/v1/systemone")
+        self.assertEqual(client.model, "jev-latest")
+        self.assertTrue(client.inline_images)
 
     async def test_images_from_all_fragments_reach_judge(self):
         first, second = picture("first"), picture("second")
-        client = self.plugin.classifier.client
-        client.evaluate = AsyncMock(
-            side_effect=[{"complete": {"noul": 0.1}}, {"complete": {"noul": 0.99}}]
-        )
+        self.evaluate.side_effect = [
+            {"complete": {"noul": 0.1}},
+            {"complete": {"noul": 0.99}},
+        ]
         leader = Event("比较这两张图", [first])
         task = asyncio.create_task(self.plugin.on_waiting_llm_request(leader))
-        while not client.evaluate.await_count:
+        while not self.evaluate.await_count:
             await asyncio.sleep(0.01)
         follower = Event("有什么不同？", [second])
         await self.plugin.on_follow_up(follower)
         await task
-        self.assertEqual(client.evaluate.call_args.kwargs["images"], [first, second])
-        self.assertEqual(
-            client.evaluate.call_args.args[0]["message"], "比较这两张图\n有什么不同？"
-        )
+        self.assertEqual(self.evaluate.call_args.kwargs["images"], [first, second])
+        state, questions = self.evaluate.call_args.args
+        self.assertEqual(state["message"], "比较这两张图\n有什么不同？")
+        self.assertEqual(questions["complete"]["type"], "noul")
         self.assertEqual(
             [part.type for part in leader.message_obj.message],
             ["Plain", "Image", "Image"],
         )
 
-    async def test_bad_probability_falls_back_to_submission(self):
-        self.plugin.classifier.client.evaluate = AsyncMock(
-            return_value={"complete": {"noul": True}}
-        )
-        event = Event("hello")
-        await asyncio.wait_for(self.plugin.on_waiting_llm_request(event), 1)
+    async def test_service_failure_sends(self):
+        self.evaluate.side_effect = ValueError("JEV HTTP 500")
+        self.assertFalse((await self.judge("hello")).stopped)
+
+    async def test_bad_probability_sends(self):
+        self.evaluate.return_value = {"complete": {"noul": True}}
+        self.assertFalse((await self.judge("hello")).stopped)
+
+    async def test_missing_key_skips_judging(self):
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": ""}):
+            plugin = debounce.DebouncePlugin(None, {"delay_seconds": 0})
+        plugin.jev.evaluate = AsyncMock()
+        event = Event("如果")
+        await asyncio.wait_for(plugin.on_waiting_llm_request(event), 1)
         self.assertFalse(event.stopped)
+        plugin.jev.evaluate.assert_not_awaited()
+        await plugin.terminate()
 
 
 if __name__ == "__main__":

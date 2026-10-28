@@ -31,7 +31,7 @@
 本插件对每位用户的连续消息做两层防抖：
 
 1. **阅读延迟**：每条消息到达后，按"读完它所需的时间"等待（短消息约 0.8 秒，长消息、图片自动延长），期间新消息会续期，连发多条只会合并成一条。
-2. **完整性判断**：等待结束后用 ONNX（BERT）或 TypeSafe JEV 判断合并后的内容是否说完；没说完就继续等下一条，直到说完或达到最长等待时间。
+2. **完整性判断**：等待结束后调用在线决策模型 JEV（默认经 OpenRouter）判断合并后的内容是否说完；没说完就继续等下一条，直到说完或达到最长等待时间。
 
 - ✅ 连发、刷屏、分段输入都只触发一次 LLM 调用
 - ✅ 群聊中按发送者分别合并，不会把不同人的话拼在一起
@@ -42,11 +42,10 @@
 ## 🚀 功能特性
 
 - **阅读延迟**：只有一个 `delay_seconds` 需要调，长度自适应
-- **智能判断**：ONNX（Small / Normal）或 JEV（支持图片）；也可设为 `none` 只用延迟
+- **在线判断**：JEV 决策模型（默认 OpenRouter，支持图片），无需本地模型或 GPU；也可设为 `none` 只用延迟
 - **按发送者合并**：群聊每位用户独立缓冲，图片、表情等组件原样保留
 - **取消过时回复**：可选，中止的回复不写入对话历史
 - **不重放消息**：合并内容直接写回第一条消息，其他插件、限流、内容审核只处理每条原始消息一次
-- **自动下载**：首次使用 ONNX 时自动从 ModelScope 下载模型
 
 ---
 
@@ -100,14 +99,13 @@ git clone https://github.com/yourusername/astrbot_plugin_debounce.git
 | `usage_scope` | 选择 | `both` | `both` / `group` / `private` |
 | `delay_seconds` | 浮点 | `0.8` | 每条消息最短等待（秒）；`0` 关闭延迟，每条消息立即判断 |
 | `max_wait_seconds` | 浮点 | `15` | 从第一条消息起的最长等待；`0` 不限 |
-| `classifier_backend` | 选择 | `onnx` | `onnx` / `jev` / `none`（只按延迟合并） |
+| `classifier_backend` | 选择 | `jev` | `jev`（在线判断） / `none`（只按延迟合并） |
 | `send_threshold` | 浮点 | `0.8` | 完整性判断阈值（0-1），越高越严格 |
-| `model_type` | 选择 | `small` | ONNX 模型：`small`（轻量快速）/ `normal`（精准度高） |
 | `merge_group_followups` | 布尔 | `false` | 群聊中同一用户未 @ 机器人的后续消息也合并 |
 | `cancel_on_new_message` | 布尔 | `true` | 回复送达前同一用户又发消息时，中止旧回复并合并重答 |
 | `jev_*` | — | — | 见下方 JEV 说明 |
 
-> 1.3.0 起 `timeout_seconds` 被 `max_wait_seconds` 取代，旧值不会迁移。
+> 1.3.0 起 `timeout_seconds` 被 `max_wait_seconds` 取代，旧值不会迁移；本地 ONNX 模型（`model_type`）已移除。
 
 ### 群聊后续消息（`merge_group_followups`）
 
@@ -126,54 +124,45 @@ git clone https://github.com/yourusername/astrbot_plugin_debounce.git
 已经流式输出给用户的文字无法撤回；非流式请求已发出的部分仍会计费。
 关闭此项时交由 AstrBot 自带的处理：工具调用间隙的补充消息会并入当前回复，否则排队等待。
 
-### 使用 TypeSafe JEV
+### 判断模型：JEV（OpenRouter）
 
-将 `classifier_backend` 切换为 `jev`，填写 `jev_api_key`，然后重载插件。
-也可将密钥放在 AstrBot 进程的环境变量 `TYPESAFE_API_KEY` 中，配置中的密钥优先。
+1. 在 [openrouter.ai/keys](https://openrouter.ai/keys) 创建密钥；
+2. 填入 `jev_api_key`（或设置 AstrBot 进程的环境变量 `OPENROUTER_API_KEY`，配置优先）；
+3. 重载插件。其余默认值即可用：
 
 ```json
 {
-  "enabled": true,
   "classifier_backend": "jev",
-  "jev_api_key": "你的 TypeSafe API Key",
-  "jev_base_url": "https://api.typesafe.ai/v1",
+  "jev_api_key": "sk-or-...",
+  "jev_base_url": "https://openrouter.ai/api/v1",
   "jev_model": "jev-latest",
   "jev_timeout_seconds": 10,
-  "send_threshold": 0.8,
-  "delay_seconds": 0.8,
-  "max_wait_seconds": 15
+  "send_threshold": 0.8
 }
 ```
 
-使用[官方 System One 接口](https://docs.typesafe.ai/api/system-one)的 `Noul`
-问题获取“用户是否已表达完整”的概率，与 `send_threshold` 比较。
-JEV 模式不加载 ONNX、Tokenizer，也不下载 ModelScope 模型；仅需 AstrBot 自带的
-`aiohttp` 即可运行。`requirements.txt` 仍保留原有 ONNX 后端的依赖，常规安装会安装这些依赖。
-默认后端仍为 `onnx`，`model_type` 仅对 ONNX 生效。
+插件调用 OpenRouter 的 [System One 接口](https://openrouter.ai/docs/api/api-reference/systemone/submit-a-system-one-request)，
+用 [JEV](https://openrouter.ai/docs/guides/community/jev) 的 `noul` 问题获取“用户是否已表达完整”的概率，与 `send_threshold` 比较。
+`jev-latest` 会映射到最新的 `typesafe/jev-*`；也可固定版本，如 `typesafe/jev-1.14`。
 
-JEV 超时、缺少密钥、HTTP 错误或返回值非法时，直接提交已合并的消息，避免缓存丢失或阻塞回复。
-`max_wait_seconds` 是等待用户后续消息的上限，`jev_timeout_seconds` 是单次远程判断的超时，
-两者相互独立。`jev_base_url` 支持 `/v1` 基地址或完整的
-`/v1/systemone` 地址，不是 Chat Completions 接口。修改后端、模型或密钥后需重载插件。
+未配置密钥、超时、HTTP 错误或返回值非法时，直接提交已合并的消息，不会丢失或卡住；
+未配置密钥时插件只按阅读延迟合并。`max_wait_seconds` 是等待用户后续消息的上限，
+`jev_timeout_seconds` 是单次判断的超时，两者相互独立。修改密钥或地址后需重载插件。
 
-### 使用 OpenRouter JEV
-
-设置 `jev_base_url` 为 `https://openrouter.ai/api/v1`，`jev_model` 为
-`typesafe/jev-1.14`，`jev_api_key` 填 OpenRouter 密钥，然后重载插件。
-文本与图片均支持；插件会将 OpenRouter 图片内嵌到 `state.images` 的 `image_url` 中，
-与完整文字上下文一起发送。OpenRouter 会忽略原生 `assets`，因此自动使用此格式。
+也可直连 TypeSafe：`jev_base_url` 填 `https://api.typesafe.ai/v1`，密钥填 TypeSafe 密钥
+（或环境变量 `TYPESAFE_API_KEY`）。`jev_base_url` 支持 `/v1` 基地址或完整的 `/v1/systemone` 地址，不是 Chat Completions 接口。
 
 ### 图片与图文消息
 
-JEV 后端默认启用 `jev_enable_images`，纯图片也会参与完整性判断。
+`jev_enable_images` 默认开启，纯图片也会参与完整性判断。
 连续图文消息合并时，JEV 会结合缓存中的全部图片与文字判断；合并后的消息保留每条消息的图片，
 回复模型能看到所有图片。
 `jev_max_images` 默认 4（范围 1–8），限制单次传给 JEV 的最近图片数量，
 不会删除传给回复模型的其他图片。关闭图片判断时，纯图片直接交给回复模型，图文仅按文字判断。
 
-TypeSafe 官方及原生中转使用[原生实验性图片接口](https://docs.typesafe.ai/images)的 `assets` 和
-`TypeSafe-Danger-Zone-Images: true` 请求头。图片会校正方向、取动画首帧、
-转换 JPEG 并缩放/留白至官方尺寸范围，原图不变。中转服务必须支持这些字段和请求头。
+图片会校正方向、取动画首帧、转换 JPEG 并缩放/留白至官方尺寸范围，原图不变。
+OpenRouter 上图片以 `image_url` 内嵌在 `state.images` 中发送；直连 TypeSafe 时使用
+[原生实验性图片接口](https://docs.typesafe.ai/images)的 `assets` 与 `TypeSafe-Danger-Zone-Images: true` 请求头。
 图片读取失败或接口拒绝图片时，直接提交已合并的原始图片和文字。
 
 ---
@@ -220,41 +209,6 @@ LLM:  虽然今天很累，但还是要注意休息哦！
 
 ---
 
-## 🔧 模型说明
-
-插件提供两种模型，均托管在 [ModelScope](https://modelscope.cn/)：
-
-| 模型 | 大小 | 速度 | 准确率 | 推荐场景 |
-|------|------|------|--------|---------|
-| **Small** | ~10MB | ⚡⚡⚡ | ~90% | 日常使用，CPU 环境 |
-| **Normal** | ~100MB | ⚡⚡ | ~95% | 高准确度需求 |
-
-### 模型仓库
-
-- Small: [advent259141/astrbot_debouncer_small](https://modelscope.cn/models/advent259141/astrbot_debouncer_small)
-- Normal: [advent259141/astrbot_debouncer_normal](https://modelscope.cn/models/advent259141/astrbot_debouncer_normal)
-
-首次使用会自动下载，无需手动操作。
-
----
-
-## 📊 训练数据
-
-模型基于以下类型的中文句子训练：
-
-| 标签 | 说明 | 示例 |
-|------|------|------|
-| **0 (WAIT)** | 句子未完整 | `"如果明天不下雨"` |
-| **1 (SEND)** | 句子已完整 | `"如果明天不下雨我们去爬山"` |
-
-涵盖常见的复句结构：
-- 条件句：`如果...`、`假如...`
-- 转折句：`虽然...`、`尽管...`
-- 因果句：`因为...`、`由于...`
-- 递进句：`其实...`、`也就是说...`
-
----
-
 ## 🐛 调试
 
 将 AstrBot 日志级别设为 DEBUG，可看到每次判断的完整概率与合并内容：
@@ -274,12 +228,10 @@ LLM:  虽然今天很累，但还是要注意休息哦！
 
 **A**: 不会。插件只拦截用户发送消息触发的 LLM 请求，其他插件通过 `context.llm_generate()` 直接调用 LLM 不受影响。
 
-### Q2: 模型下载失败怎么办？
+### Q2: 判断需要多少费用 / 时间？
 
-**A**: 
-1. 检查网络连接
-2. 手动下载模型文件放入 `models/` 目录
-3. 或切换到 `small` 模型（体积更小）
+**A**: 每次判断是一次 OpenRouter 请求，按 OpenRouter 上 JEV 的价格计费；只在等待结束时判断一次（期间又收到消息才会重判），不是每条消息都判断。
+网络延迟会叠加在阅读延迟之后；不需要判断时可设 `classifier_backend` 为 `none`。
 
 ### Q3: 如何调整判断的严格程度？
 
@@ -287,11 +239,7 @@ LLM:  虽然今天很累，但还是要注意休息哦！
 - 值越大越严格（需要更高的完整概率）
 - 建议范围：0.8 - 0.9
 
-### Q4: 插件会影响性能吗？
-
-**A**: 影响极小。ONNX 推理在 CPU 上耗时 < 10ms，可忽略不计。
-
-### Q5: 什么是"取消回复"功能？
+### Q4: 什么是"取消回复"功能？
 
 **A**: 见上文[取消过时回复](#取消过时回复cancel_on_new_message)。关闭后，新消息交由 AstrBot 自带的后续消息机制处理。
 

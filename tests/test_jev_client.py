@@ -205,10 +205,12 @@ class JevHTTPTests(unittest.IsolatedAsyncioTestCase):
             await self.client.evaluate("hello", self.questions, images=[picture])
         self.assertEqual(self.requests, [])
 
-    def test_environment_and_full_endpoint(self):
-        with patch.dict(os.environ, {"TYPESAFE_API_KEY": "env-test-key"}):
-            client = jev.JevClient({"jev_base_url": self.base_url + "/systemone/"})
-            self.assertEqual(client.api_key, "env-test-key")
-            self.assertEqual(client.endpoint, self.base_url + "/systemone")
+    def test_environment_key_matches_provider(self):
+        env = {"TYPESAFE_API_KEY": "typesafe-key", "OPENROUTER_API_KEY": "router-key"}
+        with patch.dict(os.environ, env):
+            native = jev.JevClient({"jev_base_url": self.base_url + "/systemone/"})
+            self.assertEqual(native.api_key, "typesafe-key")
+            self.assertEqual(native.endpoint, self.base_url + "/systemone")
+            self.assertEqual(jev.JevClient({}).api_key, "router-key")
             explicit = jev.JevClient({"jev_api_key": "configured-key"})
             self.assertEqual(explicit.api_key, "configured-key")
