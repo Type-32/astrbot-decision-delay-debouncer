@@ -9,12 +9,6 @@ import uuid
 from urllib.parse import urlsplit
 
 
-def image_components(event) -> list:
-    """Read direct image components without treating filenames as message text."""
-    message = getattr(getattr(event, "message_obj", None), "message", None) or []
-    return [part for part in message if getattr(part, "type", None) == "Image"]
-
-
 def image_source(image) -> str:
     """Return a source usable by AstrBot's image resolver and reply provider."""
     if isinstance(image, str):

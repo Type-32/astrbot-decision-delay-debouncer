@@ -1,65 +1,75 @@
 """
 AstrBot 消息防抖插件
-使用 BERT 模型判断用户是否说完一句话，避免频繁调用 LLM
+按阅读时间延迟合并连续消息，再用 ONNX / JEV 判断是否说完，避免频繁调用 LLM
 """
 
-import os
-import time
 import asyncio
-from typing import Dict, Optional
+import math
+import os
+import re
+import time
 from dataclasses import dataclass, field
+from typing import Optional
 
 from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star
 from astrbot.api.star import StarTools
 from astrbot.api.provider import ProviderRequest, LLMResponse
 from astrbot.api import logger, AstrBotConfig
 
-from .jev_client import JevClient, image_components, image_source, number
+from .jev_client import JevClient, number
+
+CJK = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
+
+
+def reading_delay(text: str, images: int, minimum: float) -> float:
+    """Seconds a person needs to read one message; `minimum` <= 0 disables waiting."""
+    if minimum <= 0:
+        return 0.0
+    units = len(CJK.findall(text)) * 0.5 + len(CJK.sub(" ", text).split())
+    # ponytail: fixed 4 words/s, 1 s per image, 5 s cap; expose if tuning is needed
+    return min(5.0, max(minimum, units / 4 + images))
 
 
 @dataclass
-class MessageBuffer:
-    """消息缓冲区，用于存储用户未完成的消息"""
+class Burst:
+    """One sender's messages, held by the first (leader) event until flushed."""
 
-    messages: list = field(default_factory=list)
-    images: list = field(default_factory=list)
-    image_urls: list[str] = field(default_factory=list)
-    last_update: float = field(default_factory=time.time)
-    event: Optional[AstrMessageEvent] = None  # 保存最后一个event用于超时发送
+    leader: AstrMessageEvent
+    first_at: float
+    texts: list = field(default_factory=list)
+    parts: list = field(default_factory=list)  # non-Plain components, in order
+    merged: bool = False  # holds more than the leader's own message
+    deadline: float = 0.0
+    waiting: bool = False  # judged incomplete: wait for the next message
+    gen: int = 0
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
 
-    def add(self, message: str, event: AstrMessageEvent = None, image_urls=None):
-        if message:
-            self.messages.append(message)
-        self.last_update = time.time()
-        if event:
-            self.event = event
-            known = {image_source(image) for image in self.images}
-            for image in image_components(event):
-                if image_source(image) not in known:
-                    self.images.append(image)
-                    known.add(image_source(image))
-        sources = image_urls or [
-            image_source(image) for image in image_components(event)
-        ]
-        for source in sources:
-            if source and source not in self.image_urls:
-                self.image_urls.append(source)
+    def add(self, text: str, parts: list, delay: float):
+        if text:
+            self.texts.append(text)
+        self.parts.extend(parts)
+        self.deadline = max(self.deadline, time.monotonic() + delay)
+        self.waiting = False
+        self.gen += 1
+        self.changed.set()
 
-    def get_full_text(self) -> str:
-        return " ".join(self.messages)
+    @property
+    def images(self) -> list:
+        return [part for part in self.parts if getattr(part, "type", None) == "Image"]
 
-    def clear(self):
-        self.messages = []
-        self.images = []
-        self.image_urls = []
-        self.last_update = time.time()
-        self.event = None
 
-    def is_timeout(self, timeout_seconds: int) -> bool:
-        if timeout_seconds <= 0:
-            return False
-        return time.time() - self.last_update > timeout_seconds
+@dataclass
+class Run:
+    """A released burst whose LLM reply may still be cancelled."""
+
+    event: AstrMessageEvent
+    task: asyncio.Task
+    texts: list
+    parts: list
+    req: Optional[ProviderRequest] = None
+    answered: bool = False  # on_llm_response fired: the reply is being delivered
 
 
 class SentenceClassifier:
@@ -141,55 +151,35 @@ class JevSentenceClassifier:
         return probability, probability
 
 
+class FollowUpFilter(filter.CustomFilter):
+    """Wake follow-ups from a sender with an open burst or a cancellable reply."""
+
+    plugin = None
+
+    def filter(self, event, cfg) -> bool:
+        plugin = FollowUpFilter.plugin
+        try:
+            return plugin is not None and plugin._follow_up_kind(event) is not None
+        except Exception:  # a raising filter would be reported to the chat
+            return False
+
+
 class DebouncePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-
-        # 消息缓冲区 {session_id: MessageBuffer}
-        self.buffers: Dict[str, MessageBuffer] = {}
-
-        # 正在等待中的会话集合（等待更多消息）
-        self.waiting_sessions: set = set()
-
-        # 后台监控任务集合 {session_id: Task}
-        self.monitor_tasks: Dict[str, asyncio.Task] = {}
-
-        # 跳过防抖的消息ID集合（伪造的消息）
-        self.skip_debounce_msg_ids: set = set()
-
-        # 正在处理LLM请求的会话集合
-        self.pending_llm_sessions: set = set()
-
-        # 需要丢弃下一个响应的会话集合（简化：只需要标记，不需要计数）
-        self.discard_next_response: set = set()
-
-        # 正在等待session lock的消息ID {session_id: msg_id}
-        self.waiting_msg_ids: Dict[str, str] = {}
-
-        # 应该被取消的消息ID集合（在on_llm_request中直接取消）
-        self.should_cancel_msg_ids: set = set()
-
-        # 分类器（延迟加载）
+        self.bursts: dict[str, Burst] = {}  # sender key -> waiting burst
+        self.runs: dict[str, Run] = {}  # sender key -> released burst
+        self.carry: dict[str, tuple[list, list]] = {}  # cancelled run content
         self.classifier = None
-
-        # 模型加载锁（防止并发加载）
         self._model_load_lock = asyncio.Lock()
-
-        # 使用 StarTools 获取数据目录
         self.data_dir = StarTools.get_data_dir()
-
-        # 超时检查任务
-        self._timeout_task: Optional[asyncio.Task] = None
+        self._closing = False
+        FollowUpFilter.plugin = self
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self):
-        """AstrBot 加载完成后的初始化"""
-        # 启动后台清理任务
-        self._timeout_task = asyncio.create_task(self._timeout_checker())
-        logger.debug("消息防抖插件后台任务已启动")
-
-        # 异步预加载模型
+        """AstrBot 加载完成后预加载模型"""
         try:
             await self._load_classifier_async()
         except Exception as e:
@@ -199,10 +189,11 @@ class DebouncePlugin(Star):
     async def _load_classifier_async(self):
         """异步加载分类模型"""
         async with self._model_load_lock:
-            if self.classifier is not None:
+            backend = self.config.get("classifier_backend", "onnx")
+            if self.classifier is not None or backend == "none":
                 return
 
-            if self.config.get("classifier_backend", "onnx") == "jev":
+            if backend == "jev":
                 self.classifier = JevSentenceClassifier(self.config)
                 logger.debug("消息防抖已选择 JEV 后端")
                 return
@@ -299,425 +290,228 @@ class DebouncePlugin(Star):
             logger.warning(f"防抖判断失败（{type(exc).__name__}），提交已缓存消息")
             return 1.0
 
-    def _get_buffer(self, session_id: str) -> MessageBuffer:
-        """获取或创建消息缓冲区"""
-        if session_id not in self.buffers:
-            self.buffers[session_id] = MessageBuffer()
-        return self.buffers[session_id]
+    # ---------- helpers ----------
 
-    @filter.on_waiting_llm_request(priority=100)
-    async def on_waiting_llm_request(self, event: AstrMessageEvent):
-        """即将调用 LLM 时的通知（在 session lock 之前）- 用于检测新消息到达"""
-
-        # 检查是否启用
+    def _applies(self, event: AstrMessageEvent) -> bool:
         if not self.config.get("enabled", True):
-            return
+            return False
+        scope = self.config.get("usage_scope", "both")
+        return scope == "both" or (scope == "private") == event.is_private_chat()
 
-        # 检查使用场景
-        usage_scope = self.config.get("usage_scope", "both")
-        is_private = event.is_private_chat()
-        if usage_scope == "group" and is_private:
-            return
-        if usage_scope == "private" and not is_private:
-            return
+    @staticmethod
+    def _key(event: AstrMessageEvent) -> str:
+        return f"{event.unified_msg_origin}\x00{event.get_sender_id()}"
 
-        session_id = event.message_obj.session_id
-        msg_id = event.message_obj.message_id
+    def _provider_prefix(self, event: AstrMessageEvent) -> str:
+        """Mirror AstrBot's provider wake-prefix rule (agent_request / internal)."""
+        get_config = getattr(self.context, "get_config", None)
+        if get_config is None or event.get_platform_name() == "webchat":
+            return ""
+        cfg = get_config(umo=event.unified_msg_origin)
+        prefix = cfg.get("provider_settings", {}).get("wake_prefix", "") or ""
+        for bot_prefix in cfg.get("wake_prefix", []) or []:
+            if prefix.startswith(bot_prefix):
+                prefix = prefix[len(bot_prefix) :]
+        return prefix
 
-        # 跳过伪造消息
-        if msg_id in self.skip_debounce_msg_ids:
-            # 不在这里移除，留到 on_llm_request 移除
-            logger.debug(f"[Debounce] 检测到伪造消息（跳过状态检查）: {session_id}")
-            return
+    @staticmethod
+    def _text(event: AstrMessageEvent, prefix: str, required=True) -> Optional[str]:
+        """Message text without the provider prefix; None if it can't reach the LLM."""
+        text = (event.message_str or "").strip()
+        if prefix and text.startswith(prefix):
+            return text[len(prefix) :].strip()
+        return None if prefix and required else text
 
-        # 如果该session有消息正在等待锁，取消它（只处理最新的消息）
-        if session_id in self.waiting_msg_ids:
-            old_msg_id = self.waiting_msg_ids[session_id]
-            self.should_cancel_msg_ids.add(old_msg_id)
-            logger.debug(
-                f"[Debounce] 标记前一个等待中的消息应被取消: {session_id}, msg_id: {old_msg_id}"
-            )
+    @staticmethod
+    def _parts(event: AstrMessageEvent) -> list:
+        return [
+            part
+            for part in event.message_obj.message
+            if getattr(part, "type", None) != "Plain"
+        ]
 
-        # 记录当前消息正在等待锁
-        self.waiting_msg_ids[session_id] = msg_id
+    def _delay(self, text: str, parts: list) -> float:
+        images = sum(getattr(part, "type", None) == "Image" for part in parts)
+        return reading_delay(text, images, float(self.config.get("delay_seconds", 0.8)))
 
-        # 取消之前的监控任务
-        if session_id in self.monitor_tasks:
-            self.monitor_tasks[session_id].cancel()
-            del self.monitor_tasks[session_id]
-            logger.debug(f"[Debounce] 新消息到达，取消监控任务: {session_id}")
+    @staticmethod
+    def _adopt_files(source: AstrMessageEvent, target: AstrMessageEvent):
+        """Stop `source`'s cleanup from deleting media the merged message still needs."""
+        # ponytail: reads AstrBot's private list; no public getter in v4.29.1
+        for path in list(getattr(source, "_temporary_local_files", ())):
+            source.untrack_temporary_local_file(path)
+            target.track_temporary_local_file(path)
 
-        # 如果之前的请求还在处理中，标记需要丢弃其响应
-        if session_id in self.pending_llm_sessions:
-            self.discard_next_response.add(session_id)
-            logger.debug(f"[Debounce] 新消息到达，标记旧LLM响应需要丢弃: {session_id}")
+    def _follow_up_kind(self, event: AstrMessageEvent) -> Optional[str]:
+        """'absorb' into an open burst, 'cancel' a running reply, or None."""
+        if not self._applies(event):
+            return None
+        if not event.is_at_or_wake_command and (
+            event.is_private_chat()
+            or not self.config.get("merge_group_followups", False)
+        ):
+            return None
+        if not (event.message_str or "").strip() and not self._parts(event):
+            return None
+        key = self._key(event)
+        if key in self.bursts:
+            return "absorb"
+        run = self.runs.get(key)
+        if run is None or run.answered or run.task.done():
+            return None
+        if not self.config.get("cancel_on_new_message", True):
+            return None
+        # Only cancel for a message that can itself reach the LLM.
+        if self._text(event, self._provider_prefix(event)) is None:
+            return None
+        return "cancel"
 
-            # The pending request already retains its text in the buffer.
+    def _absorb(self, burst: Burst, event: AstrMessageEvent):
+        text = self._text(event, self._provider_prefix(event), required=False) or ""
+        parts = self._parts(event)
+        burst.merged = True
+        burst.add(text, parts, self._delay(text, parts))
+        self._adopt_files(event, burst.leader)
+        event.stop_event()
 
-    @filter.on_llm_request(priority=100)
-    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """核心防抖逻辑"""
+    def _cancel(self, key: str, event: AstrMessageEvent):
+        run = self.runs.pop(key)
+        if run.req is None:
+            # Not built yet: AstrBot returns at on_llm_request for a stopped event.
+            run.event.stop_event()
+        else:
+            # Same per-event flag /stop uses; AstrBot polls it every 0.5 s.
+            run.event.set_extra("agent_stop_requested", True)
+            run.req.conversation = None  # keep the aborted turn out of history
+        self.carry[key] = (run.texts, run.parts)
+        self._adopt_files(run.event, event)
+        event.is_at_or_wake_command = True
+        logger.debug(f"[Debounce] 新消息到达，取消进行中的回复: {key}")
 
-        # 检查是否启用
-        if not self.config.get("enabled", True):
-            return
-
-        # 检查使用场景
-        usage_scope = self.config.get("usage_scope", "both")
-        is_private = event.is_private_chat()
-        if usage_scope == "group" and is_private:
-            return
-        if usage_scope == "private" and not is_private:
-            return
-
-        session_id = event.message_obj.session_id
-        message_text = event.message_str.strip()
-        msg_id = event.message_obj.message_id
-
-        # 清除等待记录（当前消息获得了锁）
-        if self.waiting_msg_ids.get(session_id) == msg_id:
-            del self.waiting_msg_ids[session_id]
-
-        # 优先检查：如果这条消息被标记为应该取消，加入buffer后取消
-        if msg_id in self.should_cancel_msg_ids:
-            self.should_cancel_msg_ids.remove(msg_id)
-            if not message_text and not image_components(event) and not req.image_urls:
-                event.stop_event()
-                return
-            # 将消息加入buffer，确保它能与后续消息合并
-            buffer = self._get_buffer(session_id)
-            buffer.add(message_text, event, req.image_urls)
-            # 标记为等待状态，以便后续消息能合并
-            self.waiting_sessions.add(session_id)
-            logger.debug(
-                f"[Debounce] 消息已加入buffer但被取消（等待合并）: {session_id}, msg_id: {msg_id}"
-            )
-            event.stop_event()
-            return
-
-        # 检查模型是否加载成功，如果未加载则尝试加载
+    async def _judge(self, burst: Burst) -> float:
+        if self.config.get("classifier_backend", "onnx") == "none":
+            return 1.0
         if self.classifier is None:
             try:
                 await self._load_classifier_async()
-            except Exception as e:
-                logger.warning(f"模型加载失败，跳过防抖: {e}")
-                return
+            except Exception as exc:
+                logger.warning(f"模型加载失败，仅按延迟防抖: {exc}")
+                return 1.0
+        return await self._predict_score("\n".join(burst.texts), burst.images)
 
-        if self.classifier is None:
-            return
-
-        if not message_text and not image_components(event) and not req.image_urls:
-            return
-
-        # 跳过伪造消息（已经是超时后主动发送的，直接通过）
-        if msg_id in self.skip_debounce_msg_ids:
-            self.skip_debounce_msg_ids.remove(msg_id)
-            # 标记正在处理LLM请求
-            self.pending_llm_sessions.add(session_id)
-            logger.debug(f"[Debounce] 伪造消息直接通过: {session_id}")
-            return
-
-        buffer = self._get_buffer(session_id)
+    async def _wait(self, burst: Burst, event: AstrMessageEvent) -> bool:
+        """Hold the leader until flush; False if the user stopped it meanwhile."""
+        max_wait = float(self.config.get("max_wait_seconds", 15))
+        cap = burst.first_at + max_wait if max_wait > 0 else math.inf
         threshold = self.config.get("send_threshold", 0.8)
-        timeout_seconds = self.config.get("timeout_seconds", 10)
-
-        # 关键修复：如果该会话正在等待中 OR 有LLM正在处理，将新消息添加到buffer
-        # 这样可以确保连续多条消息都能正确合并
-        should_merge = (session_id in self.waiting_sessions) or (
-            session_id in self.pending_llm_sessions
-        )
-
-        if should_merge:
-            buffer.add(message_text, event, req.image_urls)
-            req.image_urls = list(buffer.image_urls)
-            logger.debug(
-                f"消息已添加到缓冲区: {session_id}, buffer消息数: {len(buffer.messages)}"
-            )
-
-            # 优化：如果buffer中有多条消息（说明有被取消的消息），直接发送
-            if (
-                len(buffer.messages) > 1
-                and self.config.get("classifier_backend", "onnx") != "jev"
-            ):
-                # 取消监控任务
-                if session_id in self.monitor_tasks:
-                    self.monitor_tasks[session_id].cancel()
-                    del self.monitor_tasks[session_id]
-
-                # 清除等待标记
-                self.waiting_sessions.discard(session_id)
-
-                # 直接发送合并消息
-                full_text = buffer.get_full_text()
-                req.prompt = full_text
-                logger.debug(
-                    f"[Debounce] 多条消息合并直接发送（跳过判断）: {full_text}"
-                )
-
-                # 注意：不清空buffer！等LLM成功响应后再清空
-                # 因为在响应前可能还有新消息到达,需要全部合并
-
-                # 注意：不清除discard标记！因为旧的LLM响应可能还在路上
-                # 旧响应到达时会检测到discard标记并被丢弃
-
-                # 标记该会话正在处理新的 LLM 请求
-                self.pending_llm_sessions.add(session_id)
-                return
-
-            # 只有一条消息，需要判断完整性
-            full_text = buffer.get_full_text()
-            score_send = await self._predict_score(
-                full_text, buffer.images or buffer.image_urls
-            )
-            # A remote judgment may finish after another message has arrived.
-            is_complete = (
-                score_send >= threshold and session_id not in self.waiting_msg_ids
-            )
-            logger.debug(
-                f"完整概率: {score_send:.2f} | 判定: {'发送' if is_complete else '继续等待'}"
-            )
-
-            if is_complete:
-                # 现在完整了，取消监控任务
-                if session_id in self.monitor_tasks:
-                    self.monitor_tasks[session_id].cancel()
-                    del self.monitor_tasks[session_id]
-
-                # 清除等待标记
-                self.waiting_sessions.discard(session_id)
-
-                # 修改 ProviderRequest 的 prompt 为合并后的完整文本
-                req.prompt = full_text
-                logger.debug(f"[Debounce] 合并消息发送: {full_text}")
-
-                # 注意：不清空buffer！等LLM成功响应后再清空
-
-                # 清除丢弃标记（这是新的请求，不应该被丢弃）
-                self.discard_next_response.discard(session_id)
-
-                # 标记该会话正在处理新的 LLM 请求
-                self.pending_llm_sessions.add(session_id)
-                return  # 让这条消息正常发送
-            else:
-                # 还是不完整，阻止当前消息
-                event.stop_event()
-
-                # 重新启动监控任务（因为之前的任务在 on_waiting_llm_request 中被取消了）
-                if timeout_seconds > 0 and session_id not in self.monitor_tasks:
-                    task = asyncio.create_task(
-                        self._monitor_session(session_id, timeout_seconds)
+        while not self._closing:
+            if event.is_stopped() or event.get_extra("agent_stop_requested"):
+                return False
+            now = time.monotonic()
+            if now >= cap:
+                return True
+            if burst.waiting or now < burst.deadline:
+                until = cap if burst.waiting else min(burst.deadline, cap)
+                burst.changed.clear()
+                try:
+                    # 0.5 s slices so /stop and /reset are noticed promptly.
+                    await asyncio.wait_for(
+                        burst.changed.wait(), min(until - now, 0.5)
                     )
-                    self.monitor_tasks[session_id] = task
-                    logger.debug(f"[Debounce] 重新启动监控任务: {session_id}")
-                return
+                except asyncio.TimeoutError:
+                    pass
+                continue
+            gen = burst.gen
+            score = await self._judge(burst)
+            logger.debug(f"[Debounce] 完整概率: {score:.2f}")
+            if burst.gen != gen:
+                continue  # a message arrived while judging
+            if score >= threshold:
+                return True
+            burst.waiting = True
+        return True
 
-        # 首次收到消息，添加到buffer
-        buffer.add(message_text, event, req.image_urls)
-        req.image_urls = list(buffer.image_urls)
-        full_text = buffer.get_full_text()
-
-        # 判断完整性（异步调用）
-        score_send = await self._predict_score(
-            full_text, buffer.images or buffer.image_urls
+    async def _lead(self, key: str, event: AstrMessageEvent, prefix: str, text: str):
+        texts, parts = self.carry.pop(key, ([], []))
+        burst = Burst(
+            event, time.monotonic(), list(texts), list(parts), merged=bool(texts or parts)
         )
-        is_complete = score_send >= threshold and session_id not in self.waiting_msg_ids
-        logger.debug(
-            f"完整概率: {score_send:.2f} | 判定: {'发送' if is_complete else '等待'}"
-        )
-
-        if is_complete:
-            # 完整，让消息通过（不清空buffer,等LLM响应后清空）
-            # 清除丢弃标记（这是新的请求，不应该被丢弃）
-            self.discard_next_response.discard(session_id)
-            # 标记该会话正在处理 LLM 请求
-            self.pending_llm_sessions.add(session_id)
-            return
-        else:
-            # 不完整，阻止发送，启动监控任务
+        self.bursts[key] = burst
+        own_parts = self._parts(event)
+        burst.add(text, own_parts, self._delay(text, own_parts))
+        try:
+            released = await self._wait(burst, event)
+        finally:
+            if self.bursts.get(key) is burst:
+                del self.bursts[key]
+        if not released:
             event.stop_event()
-            self.waiting_sessions.add(session_id)
-
-            # 启动后台监控任务（如果还没有）
-            if timeout_seconds > 0 and session_id not in self.monitor_tasks:
-                task = asyncio.create_task(
-                    self._monitor_session(session_id, timeout_seconds)
-                )
-                self.monitor_tasks[session_id] = task
+            logger.debug(f"[Debounce] 等待中的消息被停止，丢弃缓存: {key}")
             return
+        if burst.merged:
+            merged = prefix + "\n".join(burst.texts)
+            event.message_str = merged
+            event.message_obj.message_str = merged
+            event.message_obj.message = ([Plain(merged)] if merged else []) + burst.parts
+            logger.debug(f"[Debounce] 合并发送: {merged[:50]}")
+        run = Run(event, asyncio.current_task(), burst.texts, burst.parts)
+        self.runs[key] = run
+        run.task.add_done_callback(
+            lambda _: self.runs.pop(key) if self.runs.get(key) is run else None
+        )
+
+    # ---------- hooks ----------
+
+    # Lowest priority: other plugins' handlers for the same message run first.
+    @filter.custom_filter(FollowUpFilter, priority=-100)
+    async def on_follow_up(self, event: AstrMessageEvent):
+        """Take follow-ups before AstrBot's own follow-up capture sees them."""
+        if event.get_extra("handlers_parsed_params"):
+            return  # also a command (e.g. /reset): let it run
+        kind = self._follow_up_kind(event)
+        key = self._key(event)
+        if kind == "absorb":
+            self._absorb(self.bursts[key], event)
+        elif kind == "cancel":
+            self._cancel(key, event)
+
+    @filter.on_waiting_llm_request(priority=100)
+    async def on_waiting_llm_request(self, event: AstrMessageEvent):
+        """First message of a burst waits here (before the session lock)."""
+        if event.get_extra("provider_request") is not None or not self._applies(event):
+            return
+        prefix = self._provider_prefix(event)
+        text = self._text(event, prefix)
+        if text is None:
+            return  # AstrBot drops it at the provider wake-prefix check
+        key = self._key(event)
+        if key in self.bursts:
+            self._absorb(self.bursts[key], event)
+            return
+        await self._lead(key, event, prefix, text)
+
+    @filter.on_llm_request(priority=100)
+    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        run = self.runs.get(self._key(event))
+        if run and run.event is event:
+            run.req = req
 
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
-        """LLM 响应后的钩子 - 用于丢弃过时的响应"""
-        # 检查使用场景
-        usage_scope = self.config.get("usage_scope", "both")
-        is_private = event.is_private_chat()
-        if usage_scope == "group" and is_private:
-            return
-        if usage_scope == "private" and not is_private:
-            return
-
-        session_id = event.message_obj.session_id
-
-        # 检查是否需要丢弃这个回复
-        if session_id in self.discard_next_response:
-            logger.debug(f"[Debounce] 已丢弃过时的 LLM 回复: {session_id}")
-            # 输出空文本
-            resp.completion_text = ""
-        else:
-            # 只有成功的响应才清空buffer
-            if session_id in self.buffers:
-                self.buffers[session_id].clear()
-                logger.debug(f"[Debounce] LLM响应成功,清空buffer: {session_id}")
-
-        # 清除待处理标记(无论是否丢弃,这个LLM会话都已结束)
-        self.pending_llm_sessions.discard(session_id)
-        self.discard_next_response.discard(session_id)
-
-    async def _timeout_checker(self):
-        """后台任务：定期清理过期的缓冲区"""
-        while True:
-            await asyncio.sleep(60)  # 每分钟检查一次
-
-            timeout_seconds = self.config.get("timeout_seconds", 10)
-            if timeout_seconds <= 0:
-                continue
-
-            # 清理过期的缓冲区（超过3倍超时时间）
-            expired_sessions = []
-            for session_id, buffer in self.buffers.items():
-                if (buffer.messages or buffer.image_urls) and buffer.is_timeout(
-                    timeout_seconds * 3
-                ):
-                    expired_sessions.append(session_id)
-
-            for session_id in expired_sessions:
-                del self.buffers[session_id]
-                logger.debug(f"[防抖] 清理过期缓冲区: {session_id}")
+        # Fires before the final reply is sent; past this point cancelling
+        # would drop a reply the user already sees.
+        run = self.runs.get(self._key(event))
+        if run and run.event is event:
+            run.answered = True
 
     async def terminate(self):
-        """插件卸载时的清理"""
-        tasks = list(self.monitor_tasks.values())
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self.monitor_tasks.clear()
-        if self._timeout_task:
-            self._timeout_task.cancel()
-            try:
-                await self._timeout_task
-            except asyncio.CancelledError:
-                pass
-
-        self.buffers.clear()
-        self.pending_llm_sessions.clear()
-        self.discard_next_response.clear()
-        self.skip_debounce_msg_ids.clear()
-        self.waiting_sessions.clear()
-        self.waiting_msg_ids.clear()
-        self.should_cancel_msg_ids.clear()
+        """插件卸载：立即放行等待中的消息，不丢内容"""
+        self._closing = True
+        for burst in list(self.bursts.values()):
+            burst.changed.set()
+        self.runs.clear()
+        self.carry.clear()
         self.classifier = None
+        if FollowUpFilter.plugin is self:
+            FollowUpFilter.plugin = None
         logger.debug("🛑 消息防抖插件已卸载")
-
-    async def _monitor_session(self, session_id: str, timeout_seconds: int):
-        """监控会话超时，超时后伪造事件发送"""
-        try:
-            # 等待超时时间
-            await asyncio.sleep(timeout_seconds)
-
-            # 检查buffer是否还在等待（可能已被新消息触发发送）
-            if session_id not in self.waiting_sessions:
-                return
-
-            buffer = self.buffers.get(session_id)
-            if not buffer:
-                return
-
-            # 超时了，获取缓存的消息和event
-            full_text = buffer.get_full_text()
-            saved_event = buffer.event
-            saved_images = list(buffer.images)
-
-            if (not full_text and not saved_images) or not saved_event:
-                return
-
-            logger.debug(f"[Debounce] 等待超时，伪造事件发送: {session_id}")
-
-            # Keep text and images until the replay event has been submitted.
-            if await self._send_fake_event(saved_event, full_text, images=saved_images):
-                self.waiting_sessions.discard(session_id)
-                buffer.clear()
-
-        except asyncio.CancelledError:
-            # 任务被取消（有新消息到达）
-            logger.debug(f"[Debounce] 监控任务被取消: {session_id}")
-        except Exception as e:
-            logger.error(f"[Debounce] 超时发送失败: {e}")
-            import traceback
-
-            logger.error(traceback.format_exc())
-        finally:
-            # A cancelled monitor must not remove a newer replacement task.
-            if self.monitor_tasks.get(session_id) is asyncio.current_task():
-                self.monitor_tasks.pop(session_id, None)
-
-    async def _send_fake_event(
-        self, original_event: AstrMessageEvent, message_text: str, *, images=None
-    ):
-        """伪造一个消息事件并发送到EventBus"""
-        replay_id = None
-        try:
-            from astrbot.core.star.star_tools import StarTools
-            from astrbot.core.message.components import Plain
-
-            # 保留原始消息的富文本组件(图片、表情等)
-            # 只替换文本部分,保留其他富文本元素
-            original_message = original_event.message_obj.message
-            new_message_components = []
-
-            # 遍历原始消息组件,保留非Plain类型的组件(如图片、表情等)
-            for component in original_message:
-                if not isinstance(component, Plain) and not (
-                    images is not None and getattr(component, "type", None) == "Image"
-                ):
-                    new_message_components.append(component)
-            if images is not None:
-                new_message_components.extend(images)
-
-            # 在开头添加合并后的文本
-            new_message_components.insert(0, Plain(message_text))
-
-            # 创建新消息对象
-            new_message = await StarTools.create_message(
-                type=str(original_event.message_obj.type.value),
-                self_id=original_event.get_self_id(),
-                session_id=original_event.session_id,
-                sender=original_event.message_obj.sender,
-                message=new_message_components,
-                message_str=message_text,
-                group_id=original_event.get_group_id() or "",
-                message_id=original_event.message_obj.message_id,  # 伪造消息时保留真实ID
-            )
-
-            # 标记这个消息需要跳过防抖
-            self.skip_debounce_msg_ids.add(new_message.message_id)
-            replay_id = new_message.message_id
-
-            # 伪造事件并提交
-            await StarTools.create_event(
-                abm=new_message,
-                platform=original_event.get_platform_name(),
-                is_wake=True,
-            )
-
-            logger.debug(f"[Debounce] 已伪造事件发送: {message_text[:50]}")
-            return True
-
-        except Exception as e:
-            if replay_id is not None:
-                self.skip_debounce_msg_ids.discard(replay_id)
-            logger.error(f"[Debounce] 伪造事件失败: {e}")
-            import traceback
-
-            logger.error(traceback.format_exc())
-            return False

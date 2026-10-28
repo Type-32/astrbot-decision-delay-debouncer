@@ -1,14 +1,14 @@
 # AstrBot 消息防抖插件
 
-> ⚠️ **注意：本插件仅支持 AstrBot 4.11+ 版本使用**
+> ⚠️ **注意：本插件需要 AstrBot 4.29.1+，且仅对内置 Agent 生效（Dify / Coze / DashScope 不经过防抖钩子）**
 > 
 <div align="center">
 
 [![GitHub stars](https://img.shields.io/github/stars/advent259141/astrbot_plugin_debounce?style=flat-square)](https://github.com/yourusername/astrbot_plugin_debounce)
 [![GitHub license](https://img.shields.io/github/license/advent259141/astrbot_plugin_debounce?style=flat-square)](LICENSE)
-[![AstrBot](https://img.shields.io/badge/AstrBot-v4.11+-blue?style=flat-square)](https://github.com/AstrBotdevs/AstrBot)
+[![AstrBot](https://img.shields.io/badge/AstrBot-v4.29.1+-blue?style=flat-square)](https://github.com/AstrBotdevs/AstrBot)
 
-**使用 BERT 模型智能判断用户是否说完一句话，减少不必要的 LLM 调用**
+**按阅读时间等待连续消息，再判断用户是否说完，合并后只调用一次 LLM**
 
 </div>
 
@@ -28,21 +28,25 @@
 - ❌ 浪费 API 调用次数和费用
 - ❌ 用户体验不佳
 
-本插件通过训练的 BERT 模型**实时判断句子完整性**，只在用户说完整句话后才发送给 LLM，实现：
-- ✅ 智能防抖，自动合并未完成的消息
-- ✅ 减少 LLM 调用次数，节省成本
-- ✅ 提升对话质量和用户体验
+本插件对每位用户的连续消息做两层防抖：
+
+1. **阅读延迟**：每条消息到达后，按"读完它所需的时间"等待（短消息约 0.8 秒，长消息、图片自动延长），期间新消息会续期，连发多条只会合并成一条。
+2. **完整性判断**：等待结束后用 ONNX（BERT）或 TypeSafe JEV 判断合并后的内容是否说完；没说完就继续等下一条，直到说完或达到最长等待时间。
+
+- ✅ 连发、刷屏、分段输入都只触发一次 LLM 调用
+- ✅ 群聊中按发送者分别合并，不会把不同人的话拼在一起
+- ✅ 回复生成中又补充消息时，可中止旧回复并合并重答
 
 ---
 
 ## 🚀 功能特性
 
-- **智能判断**：基于 BERT 模型，准确识别中文句子是否完整
-- **双模型支持**：提供 Small（快速）和 Normal（精准）两种模型
-- **自动下载**：首次使用时自动从 ModelScope 下载模型
-- **灵活配置**：可调节判断阈值、超时时间等参数
-- **零感知**：静默工作，不打扰用户
-- **低开销**：使用 ONNX 推理，CPU 友好
+- **阅读延迟**：只有一个 `delay_seconds` 需要调，长度自适应
+- **智能判断**：ONNX（Small / Normal）或 JEV（支持图片）；也可设为 `none` 只用延迟
+- **按发送者合并**：群聊每位用户独立缓冲，图片、表情等组件原样保留
+- **取消过时回复**：可选，中止的回复不写入对话历史
+- **不重放消息**：合并内容直接写回第一条消息，其他插件、限流、内容审核只处理每条原始消息一次
+- **自动下载**：首次使用 ONNX 时自动从 ModelScope 下载模型
 
 ---
 
@@ -68,6 +72,60 @@ git clone https://github.com/yourusername/astrbot_plugin_debounce.git
 
 ## ⚙️ 配置说明
 
+### 防抖时间
+
+每条消息的等待时间：
+
+```
+等待 = min(5 秒, max(delay_seconds, 词数 / 4 + 汉字数 / 8 + 图片数 × 1 秒))
+```
+
+| 消息 | 等待 |
+|------|------|
+| `Well` / `ok` / `嗯嗯` | 0.8 秒（`delay_seconds`） |
+| `如果明天不下雨` | 0.9 秒 |
+| 12 个单词的问题 | 3 秒 |
+| 一段长文 | 5 秒（单条上限） |
+| 一张图片 | 1 秒 |
+
+新消息会把截止时间推后到"现在 + 该消息的等待"，但从第一条消息起总共不超过 `max_wait_seconds`。
+等待结束后进行完整性判断：判定完整就发送；判定未完整则继续等下一条消息（或 `max_wait_seconds` 到期强制发送）。
+判断期间又收到消息时，会合并后重新等待、重新判断。
+
+### 配置项
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `enabled` | 布尔 | `true` | 是否启用插件 |
+| `usage_scope` | 选择 | `both` | `both` / `group` / `private` |
+| `delay_seconds` | 浮点 | `0.8` | 每条消息最短等待（秒）；`0` 关闭延迟，每条消息立即判断 |
+| `max_wait_seconds` | 浮点 | `15` | 从第一条消息起的最长等待；`0` 不限 |
+| `classifier_backend` | 选择 | `onnx` | `onnx` / `jev` / `none`（只按延迟合并） |
+| `send_threshold` | 浮点 | `0.8` | 完整性判断阈值（0-1），越高越严格 |
+| `model_type` | 选择 | `small` | ONNX 模型：`small`（轻量快速）/ `normal`（精准度高） |
+| `merge_group_followups` | 布尔 | `false` | 群聊中同一用户未 @ 机器人的后续消息也合并 |
+| `cancel_on_new_message` | 布尔 | `true` | 回复送达前同一用户又发消息时，中止旧回复并合并重答 |
+| `jev_*` | — | — | 见下方 JEV 说明 |
+
+> 1.3.0 起 `timeout_seconds` 被 `max_wait_seconds` 取代，旧值不会迁移。
+
+### 群聊后续消息（`merge_group_followups`）
+
+群聊里只有 @ 机器人、唤醒前缀或回复机器人的消息才会进入 LLM。开启此项后，
+某用户有消息正在等待时，他发送的未 @ 消息也会被合并进去。
+代价：等待窗口内他发给别人的话也会被合并。默认关闭。
+
+### 取消过时回复（`cancel_on_new_message`）
+
+回复仍在生成、尚未送达时，同一用户又发来消息：
+
+1. 对旧消息设置 AstrBot 的单事件停止标记（与 `/stop` 相同机制，只影响这位用户的这次回复）；
+2. 旧回复不写入对话历史；
+3. 旧内容与新消息合并，重新走延迟与判断后一起回复。
+
+已经流式输出给用户的文字无法撤回；非流式请求已发出的部分仍会计费。
+关闭此项时交由 AstrBot 自带的处理：工具调用间隙的补充消息会并入当前回复，否则排队等待。
+
 ### 使用 TypeSafe JEV
 
 将 `classifier_backend` 切换为 `jev`，填写 `jev_api_key`，然后重载插件。
@@ -82,20 +140,20 @@ git clone https://github.com/yourusername/astrbot_plugin_debounce.git
   "jev_model": "jev-latest",
   "jev_timeout_seconds": 10,
   "send_threshold": 0.8,
-  "timeout_seconds": 10
+  "delay_seconds": 0.8,
+  "max_wait_seconds": 15
 }
 ```
 
 使用[官方 System One 接口](https://docs.typesafe.ai/api/system-one)的 `Noul`
 问题获取“用户是否已表达完整”的概率，与 `send_threshold` 比较。
-连续收到多条片段时会重新判断合并后的完整文本，不会因为已收到两条就直接提交。
 JEV 模式不加载 ONNX、Tokenizer，也不下载 ModelScope 模型；仅需 AstrBot 自带的
 `aiohttp` 即可运行。`requirements.txt` 仍保留原有 ONNX 后端的依赖，常规安装会安装这些依赖。
 默认后端仍为 `onnx`，`model_type` 仅对 ONNX 生效。
 
 JEV 超时、缺少密钥、HTTP 错误或返回值非法时，直接提交已合并的消息，避免缓存丢失或阻塞回复。
-`timeout_seconds` 是等待用户后续消息的时长，`jev_timeout_seconds` 是单次远程判断的超时，
-两者相互独立；前者设为 0 时不自动发送。`jev_base_url` 支持 `/v1` 基地址或完整的
+`max_wait_seconds` 是等待用户后续消息的上限，`jev_timeout_seconds` 是单次远程判断的超时，
+两者相互独立。`jev_base_url` 支持 `/v1` 基地址或完整的
 `/v1/systemone` 地址，不是 Chat Completions 接口。修改后端、模型或密钥后需重载插件。
 
 ### 使用 OpenRouter JEV
@@ -108,8 +166,8 @@ JEV 超时、缺少密钥、HTTP 错误或返回值非法时，直接提交已�
 ### 图片与图文消息
 
 JEV 后端默认启用 `jev_enable_images`，纯图片也会参与完整性判断。
-连续图文消息合并时，JEV 会结合缓存中的图片与文字判断；传给回复模型的
-`image_urls` 会保留各条消息的图片，超时补发也会保留早先消息的图片。
+连续图文消息合并时，JEV 会结合缓存中的全部图片与文字判断；合并后的消息保留每条消息的图片，
+回复模型能看到所有图片。
 `jev_max_images` 默认 4（范围 1–8），限制单次传给 JEV 的最近图片数量，
 不会删除传给回复模型的其他图片。关闭图片判断时，纯图片直接交给回复模型，图文仅按文字判断。
 
@@ -118,73 +176,45 @@ TypeSafe 官方及原生中转使用[原生实验性图片接口](https://docs.t
 转换 JPEG 并缩放/留白至官方尺寸范围，原图不变。中转服务必须支持这些字段和请求头。
 图片读取失败或接口拒绝图片时，直接提交已合并的原始图片和文字。
 
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `model_type` | 选择 | `small` | 模型类型：`small`（轻量快速）/ `normal`（精准度高） |
-| `send_threshold` | 浮点 | `0.8` | 完整性判断阈值（0-1），越高越严格 |
-| `timeout_seconds` | 整数 | `10` | 超时自动发送时间（秒），设为 0 禁用 |
-| `enabled` | 布尔 | `true` | 是否启用插件 |
-| `cancel_on_new_message` | 布尔 | `true` | LLM 回复前收到新消息时取消回复 |
-| `debug_mode` | 布尔 | `false` | 调试模式，输出详细日志 |
-
-### 配置示例
-
-```json
-{
-  "model_type": "small",
-  "send_threshold": 0.6,
-  "timeout_seconds": 30,
-  "enabled": true,
-  "cancel_on_new_message": true,
-  "debug_mode": false
-}
-```
-
 ---
 
 ## 💡 使用示例
 
-### 场景 1：分段输入
+### 场景 1：连发短消息
+
+```
+用户: Well
+用户: ok          ← 0.3 秒后，续期 0.8 秒
+      ↓ 0.8 秒内无新消息 → 判断 "Well\nok"：完整
+LLM:  （一次回复）
+```
+
+### 场景 2：分段输入
 
 ```
 用户: 如果明天不下雨
-      ↓ 插件判断：未完整，等待...
-      
+      ↓ 等待 0.9 秒 → 判断：未完整，继续等下一条
 用户: 我们去爬山吧
-      ↓ 插件判断：完整，发送给 LLM
-      
+      ↓ 等待 0.8 秒 → 判断 "如果明天不下雨\n我们去爬山吧"：完整
 LLM:  好的！如果明天天气好，我们可以一起去爬山~
 ```
 
-### 场景 2：用户补充内容（启用 cancel_on_new_message）
+### 场景 3：回复中补充（`cancel_on_new_message`）
 
 ```
-用户: 如果明天不下雨
-      ↓ 判断：未完整，缓存
-
-用户: 我们去爬山吧
-      ↓ 判断：完整，发送给 LLM
-      ⏳ LLM 正在思考中...
-
-用户: 顺便带上野餐垫
-      ↓ 检测到：用户在等待回复时又发消息
-      ❌ 取消 LLM 当前回复
-      ✅ 将新消息加入缓存，继续等待
-
-用户: 和水果
-      ↓ 判断：完整，合并所有内容发送
-      
-LLM:  好的！明天天气好的话，我们去爬山，我会准备野餐垫和水果~
+用户: 帮我写首诗
+      ↓ 判断完整，开始生成 ⏳
+用户: 关于秋天
+      ↓ 中止旧回复（不写入历史），合并为 "帮我写首诗\n关于秋天"
+LLM:  （一首关于秋天的诗）
 ```
 
-### 场景 3：超时处理
+### 场景 4：最长等待
 
 ```
 用户: 虽然今天很累
-      ↓ 等待 30 秒...
-      
-      ↓ 超时，自动发送
-      
+      ↓ 判断：未完整，等待后续…
+      ↓ 距第一条消息 15 秒，强制发送
 LLM:  虽然今天很累，但还是要注意休息哦！
 ```
 
@@ -227,12 +257,13 @@ LLM:  虽然今天很累，但还是要注意休息哦！
 
 ## 🐛 调试
 
-开启调试模式后，日志会输出详细信息：
+将 AstrBot 日志级别设为 DEBUG，可看到每次判断的完整概率与合并内容：
 
 ```
-[防抖] 文本: '如果明天不下雨' | 完整概率: 0.2341 | 判定: 等待
-[防抖] 文本: '如果明天不下雨 我们去爬山' | 完整概率: 0.8762 | 判定: 发送
-[防抖] 完整发送: 如果明天不下雨 我们去爬山
+[Debounce] 完整概率: 0.23
+[Debounce] 完整概率: 0.88
+[Debounce] 合并发送: 如果明天不下雨
+我们去爬山吧
 ```
 
 ---
@@ -262,142 +293,40 @@ LLM:  虽然今天很累，但还是要注意休息哦！
 
 ### Q5: 什么是"取消回复"功能？
 
-**A**: 当用户在等待 LLM 回复时又发送新消息，插件会：
-- **启用时**：自动取消当前 LLM 回复，合并新消息后重新发送
-- **禁用时**：不取消回复，新消息会作为独立消息处理
-
-建议保持启用，以获得更好的对话体验。
+**A**: 见上文[取消过时回复](#取消过时回复cancel_on_new_message)。关闭后，新消息交由 AstrBot 自带的后续消息机制处理。
 
 ---
 
-## 🔄 取消消息机制详解
+## 🔄 工作原理
 
-当启用 `cancel_on_new_message` 时，插件会在 LLM 处理期间检测新消息，并智能取消过时的回复。
+合并内容写回 **第一条消息（leader）**，不伪造、不重放消息。
 
-### 工作原理
-
-#### 核心钩子
-
-插件使用三个 AstrBot 事件钩子协同工作：
-
-| 钩子 | 执行时机 | 作用 |
-|------|----------|------|
-| `on_waiting_llm_request` | session lock **之前** | 检测新消息到达，标记旧响应需丢弃 |
-| `on_llm_request` | session lock **之后** | BERT 判断完整性，管理缓冲区 |
-| `on_llm_response` | LLM 响应返回后 | 检查是否需要丢弃响应 |
-
-#### 关键时序
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  消息1: "小面包小面包"                                            │
-├─────────────────────────────────────────────────────────────────┤
-│  T1: on_waiting_llm_request(消息1)                                  │
-│      → 无旧任务，跳过                                             │
-│                                                                 │
-│  T2: on_llm_request(消息1)                                       │
-│      → BERT 判断: 0.04 (未完整)                                   │
-│      → buffer = ["小面包小面包"]                                  │
-│      → event.stop_event() 阻止发送                               │
-│      → 启动 30秒 监控任务                                         │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓ 3秒后
-┌─────────────────────────────────────────────────────────────────┐
-│  消息2: "我想你了"                                               │
-├─────────────────────────────────────────────────────────────────┤
-│  T3: on_waiting_llm_request(消息2)                                  │
-│      → 取消监控任务 ✅                                            │
-│                                                                 │
-│  T4: on_llm_request(消息2)                                       │
-│      → 检测到 waiting_sessions 有消息1                            │
-│      → buffer = ["小面包小面包", "我想你了"]                       │
-│      → BERT 判断: 0.97 (完整)                                     │
-│      → req.prompt = "小面包小面包 我想你了"                        │
-│      → pending_llm_sessions["session"] = "小面包小面包 我想你了"   │
-│      → 发送 LLM 请求 🚀                                           │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓ 2秒后 (LLM 还在处理中)
-┌─────────────────────────────────────────────────────────────────┐
-│  消息3: "想和你聊聊天"                                           │
-├─────────────────────────────────────────────────────────────────┤
-│  T5: on_will_llm_request(消息3) ⚡ 在 session lock 之前执行！      │
-│      → 检测到 pending_llm_sessions 有正在处理的请求               │
-│      → discard_responses.add("session") 标记丢弃 🎯              │
-│      → 恢复 "小面包小面包 我想你了" 到 buffer                      │
-│      → buffer = ["小面包小面包 我想你了"]                          │
-│                                                                 │
-│  T6: [被 session lock 阻塞，等待消息2的LLM完成...]                 │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓ 8秒后 (LLM 处理完成)
-┌─────────────────────────────────────────────────────────────────┐
-│  消息2 的 LLM 响应返回                                           │
-├─────────────────────────────────────────────────────────────────┤
-│  T7: on_llm_response(消息2的响应)                                 │
-│      → 检测到 discard_responses 包含此会话                        │
-│      → event.stop_event() 丢弃响应 🚫                            │
-│      → 用户看不到这个过时的回复 ✅                                 │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓ session lock 释放
-┌─────────────────────────────────────────────────────────────────┐
-│  消息3 继续处理                                                  │
-├─────────────────────────────────────────────────────────────────┤
-│  T8: on_llm_request(消息3)                                       │
-│      → buffer = ["小面包小面包 我想你了", "想和你聊聊天"]          │
-│      → BERT 判断: 0.95 (完整)                                     │
-│      → req.prompt = "小面包小面包 我想你了 想和你聊聊天"           │
-│      → 发送 LLM 请求 🚀                                           │
-│                                                                 │
-│  T9: on_llm_response(消息3的响应)                                 │
-│      → 正常返回 ✅                                                │
-│      → 用户看到完整的回复 🎉                                      │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+sequenceDiagram
+    participant M1 as 消息 1（leader）
+    participant M2 as 消息 2..n
+    participant P as 插件
+    participant L as LLM
+    M1->>P: on_waiting_llm_request：开启缓冲，leader 在钩子内等待
+    M2->>P: 消息处理器（早于 AstrBot 自带的后续消息捕获）
+    P->>P: 合并、续期截止时间、停止消息 2
+    P->>P: 截止时间到 → 判断完整（或达到 max_wait）
+    P->>M1: 改写 message_str 与消息组件为合并内容
+    M1->>L: 钩子返回 → 会话锁 → 构建请求 → 回复
 ```
 
-### 为什么需要 `on_waiting_llm_request`？
+| 钩子 | 作用 |
+|------|------|
+| 消息处理器（`custom_filter`，最低优先级） | 等待中的后续消息并入缓冲；回复未送达时触发取消 |
+| `on_waiting_llm_request`（会话锁之前） | 第一条消息在此等待、判断、改写 |
+| `on_llm_request` | 记录请求，取消时清除 `req.conversation` 使中止的回复不写入历史 |
+| `on_llm_response` | 回复即将送达，此后不再取消 |
 
-AstrBot 使用 **session lock** 防止同一会话的并发 LLM 请求。这意味着：
+其他说明：
 
-```
-消息2 正在调用 LLM
-    ↓
-消息3 到达
-    ↓
-消息3 的 on_llm_request 被 session lock 阻塞
-    ↓
-等待消息2 的 LLM 完成后才能执行
-    ↓
-此时检测"新消息"已经太晚了！
-```
-
-**解决方案**：`on_waiting_llm_request` 钩子在 **session lock 之前** 执行，让我们能在第一时间检测到新消息并标记旧响应需要丢弃。
-
-### 状态管理
-
-| 状态集合 | 类型 | 作用 |
-|----------|------|------|
-| `buffers` | `Dict[session_id, MessageBuffer]` | 存储未完成的消息 |
-| `waiting_sessions` | `Set[session_id]` | 标记正在等待更多消息的会话 |
-| `pending_llm_sessions` | `Dict[session_id, message_text]` | 记录正在处理 LLM 的会话及其消息 |
-| `discard_responses` | `Set[session_id]` | 标记需要丢弃响应的会话 |
-| `monitor_tasks` | `Dict[session_id, Task]` | 超时监控任务 |
-| `skip_debounce_msg_ids` | `Set[msg_id]` | 跳过防抖的伪造消息 ID |
-
-### 消息恢复机制
-
-当旧响应被取消时，插件会将原消息内容恢复到 buffer：
-
-```python
-# 在 on_waiting_llm_request 中
-if session_id in self.pending_llm_sessions:
-    old_message = self.pending_llm_sessions[session_id]  # "小面包 我想你了"
-    self.discard_responses.add(session_id)
-    
-    # 恢复到 buffer，与新消息合并
-    buffer.messages.insert(0, old_message)
-    # buffer 变为 ["小面包 我想你了", "想和你聊聊天"]
-```
-
-这确保用户发送的所有内容都不会丢失。
+- 指令消息（如 `/reset`、`/stop`）不会被合并；等待中的消息被 `/stop` 或 `/reset` 停止时，缓存直接丢弃。
+- 被合并消息中的图片等临时文件会转交给 leader，避免被提前清理。
+- 插件卸载时，等待中的消息立即带着已有内容发送，不会丢失。
 
 ---
 

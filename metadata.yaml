@@ -1,8 +1,8 @@
 name: astrbot_plugin_debounce
-desc: "支持 ONNX / JEV 判断的消息防抖插件，合并连续图文消息，减少重复 LLM 调用"
-short_desc: "智能判断消息完整性，保留图片并合并连续消息"
+desc: "按阅读时间延迟合并连续图文消息，再用 ONNX / JEV 判断是否说完，减少重复 LLM 调用"
+short_desc: "延迟 + 完整性判断，合并连续消息，可取消过时回复"
 author: Jason.Joestar
-version: 1.2.1
+version: 1.3.0
 display_name: 消息防抖
 repo: https://github.com/advent259141/astrbot_plugin_debounce
-astrbot_version: ">=4.11,<5"
+astrbot_version: ">=4.29.1,<5"

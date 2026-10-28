@@ -17,6 +17,7 @@ def load_plugin():
             "astrbot.api.star",
             "astrbot.api.event",
             "astrbot.api.provider",
+            "astrbot.api.message_components",
         ]
     }
     api = modules["astrbot.api"]
@@ -37,7 +38,13 @@ def load_plugin():
     )
     event = modules["astrbot.api.event"]
     event.AstrMessageEvent = object
+
+    class CustomFilter:
+        def __init__(self, raise_error=True, **_):
+            self.raise_error = raise_error
+
     event.filter = types.SimpleNamespace(
+        CustomFilter=CustomFilter,
         **{
             name: lambda *_a, **_k: lambda func: func
             for name in [
@@ -45,11 +52,15 @@ def load_plugin():
                 "on_waiting_llm_request",
                 "on_llm_request",
                 "on_llm_response",
+                "custom_filter",
             ]
-        }
+        },
     )
     modules["astrbot.api.provider"].ProviderRequest = object
     modules["astrbot.api.provider"].LLMResponse = object
+    modules["astrbot.api.message_components"].Plain = lambda text: types.SimpleNamespace(
+        type="Plain", text=text
+    )
     root = Path(__file__).resolve().parents[1]
     spec = importlib.util.spec_from_file_location(
         "debounce_test_module", root / "main.py", submodule_search_locations=[str(root)]
@@ -64,38 +75,301 @@ def load_plugin():
 debounce = load_plugin()
 
 
+def picture(name):
+    return types.SimpleNamespace(type="Image", file=f"base64://{name}")
+
+
 class Event:
-    def __init__(self, text, message_id="1"):
+    """The slice of AstrMessageEvent the plugin touches."""
+
+    def __init__(self, text, images=(), sender="u1", private=True, addressed=True):
         self.message_str = text
+        plain = [types.SimpleNamespace(type="Plain", text=text)] if text else []
         self.message_obj = types.SimpleNamespace(
-            session_id="test", message_id=message_id
+            message=plain + list(images), message_str=text
         )
+        self.unified_msg_origin = "qq:FriendMessage:1" if private else "qq:Group:9"
+        self.sender = sender
+        self.private = private
+        self.is_at_or_wake_command = addressed
+        self.extras = {}
+        self.files = []
         self.stopped = False
 
     def is_private_chat(self):
-        return True
+        return self.private
+
+    def get_sender_id(self):
+        return self.sender
+
+    def get_platform_name(self):
+        return "aiocqhttp"
+
+    def get_extra(self, key, default=None):
+        return self.extras.get(key, default)
+
+    def set_extra(self, key, value):
+        self.extras[key] = value
 
     def stop_event(self):
         self.stopped = True
 
+    def is_stopped(self):
+        return self.stopped
 
-class JevDebounceTests(unittest.IsolatedAsyncioTestCase):
+    def track_temporary_local_file(self, path):
+        self.files.append(path)
+
+    def untrack_temporary_local_file(self, path):
+        self.files.remove(path)
+
+    @property
+    def _temporary_local_files(self):
+        return self.files
+
+
+class BurstTests(unittest.IsolatedAsyncioTestCase):
+    """Delays are shrunk so the real clock runs each case in well under a second."""
+
+    async def asyncSetUp(self):
+        self.config = {
+            "classifier_backend": "none",
+            "delay_seconds": 0.05,
+            "max_wait_seconds": 1,
+        }
+        self.plugin = debounce.DebouncePlugin(None, self.config)
+        self.judge = AsyncMock(return_value=1.0)
+        self.plugin._predict_score = self.judge
+        self.plugin.classifier = object()
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+
+    def use_judge(self, *scores):
+        self.config["classifier_backend"] = "jev"
+        self.judge.side_effect = list(scores)
+
+    def lead(self, event):
+        task = asyncio.create_task(self.plugin.on_waiting_llm_request(event))
+        return task
+
+    async def follow(self, event):
+        """A later message: early handler first, then the LLM hook if it survives."""
+        if self.plugin._follow_up_kind(event):
+            await self.plugin.on_follow_up(event)
+        if not event.stopped:
+            return self.lead(event)
+
+    async def test_rapid_fire_merges_into_leader(self):
+        first = Event("Well")
+        task = self.lead(first)
+        await asyncio.sleep(0.01)
+        second = Event("ok", [picture("a")])
+        await self.follow(second)
+        await task
+        self.assertTrue(second.stopped)
+        self.assertFalse(first.stopped)
+        self.assertEqual(first.message_str, "Well\nok")
+        self.assertEqual(first.message_obj.message_str, "Well\nok")
+        self.assertEqual(
+            [part.type for part in first.message_obj.message], ["Plain", "Image"]
+        )
+
+    async def test_single_message_is_untouched(self):
+        event = Event("hello", [picture("a")])
+        original = event.message_obj.message
+        await self.lead(event)
+        self.assertFalse(event.stopped)
+        self.assertIs(event.message_obj.message, original)
+
+    def test_reading_delay(self):
+        delay = debounce.reading_delay
+        self.assertEqual(delay("Well \n ok", 0, 0.8), 0.8)
+        self.assertEqual(delay(" ".join(["word"] * 12), 0, 0.8), 3.0)
+        self.assertEqual(delay(" ".join(["word"] * 40), 0, 0.8), 5.0)
+        self.assertEqual(delay("", 1, 0.8), 1.0)
+        self.assertAlmostEqual(delay("如果明天不下雨", 0, 0.8), 0.875)
+        self.assertEqual(delay("anything long " * 20, 3, 0), 0.0)
+
+    async def test_incomplete_burst_waits_for_next_message(self):
+        self.use_judge(0.1, 0.95)
+        first = Event("如果明天")
+        task = self.lead(first)
+        await asyncio.sleep(0.2)  # past the delay: judged incomplete, still held
+        self.assertFalse(task.done())
+        await self.follow(Event("我们去爬山吧"))
+        await task
+        self.assertEqual(first.message_str, "如果明天\n我们去爬山吧")
+        self.assertEqual(self.judge.await_args.args[0], "如果明天\n我们去爬山吧")
+
+    async def test_max_wait_releases_incomplete_burst(self):
+        self.use_judge(0.1)
+        self.config["max_wait_seconds"] = 0.5  # longer than the 0.25 s read time
+        event = Event("hi")
+        await asyncio.wait_for(self.lead(event), 1)
+        self.assertFalse(event.stopped)
+        self.judge.assert_awaited_once()
+
+    async def test_max_wait_beats_reading_delay(self):
+        self.config["max_wait_seconds"] = 0.2
+        event = Event(" ".join(["word"] * 40))  # 5 s reading delay
+        await asyncio.wait_for(self.lead(event), 1)
+        self.assertFalse(event.stopped)
+
+    async def test_message_during_judgment_rejudges_merged_text(self):
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def slow(text, images):
+            if self.judge.await_count == 1:
+                started.set()
+                await release.wait()
+            return 0.99
+
+        self.config["classifier_backend"] = "jev"
+        self.judge.side_effect = slow
+        first = Event("如果明天")
+        task = self.lead(first)
+        await started.wait()
+        await self.follow(Event("不下雨"))
+        release.set()
+        await task
+        self.assertEqual(self.judge.await_count, 2)
+        self.assertEqual(first.message_str, "如果明天\n不下雨")
+
+    async def test_judge_failure_sends(self):
+        self.config["classifier_backend"] = "jev"
+        self.plugin._predict_score = debounce.DebouncePlugin._predict_score.__get__(
+            self.plugin
+        )
+        self.plugin.classifier = types.SimpleNamespace(
+            predict=AsyncMock(side_effect=ValueError("down"))
+        )
+        event = Event("hello")
+        await asyncio.wait_for(self.lead(event), 1)
+        self.assertFalse(event.stopped)
+
+    async def test_stopped_leader_drops_burst(self):
+        first = Event("hello")
+        self.config["delay_seconds"] = 0.3
+        task = self.lead(first)
+        await asyncio.sleep(0.01)
+        first.set_extra("agent_stop_requested", True)  # /stop while waiting
+        await task
+        self.assertTrue(first.stopped)
+        self.assertEqual(self.plugin.bursts, {})
+
+    async def test_senders_in_a_group_are_separate(self):
+        a = Event("我觉得", sender="a", private=False)
+        b = Event("你好", sender="b", private=False)
+        task_a, task_b = self.lead(a), self.lead(b)
+        await asyncio.gather(task_a, task_b)
+        self.assertEqual((a.message_str, b.message_str), ("我觉得", "你好"))
+        self.assertFalse(a.stopped or b.stopped)
+
+    async def test_group_followups_without_at_need_opt_in(self):
+        leader = Event("我想问", sender="a", private=False)
+        task = self.lead(leader)
+        await asyncio.sleep(0.01)
+        stray = Event("顺便说一下", sender="a", private=False, addressed=False)
+        self.assertIsNone(self.plugin._follow_up_kind(stray))
+        self.config["merge_group_followups"] = True
+        await self.follow(stray)
+        await task
+        self.assertTrue(stray.stopped)
+        self.assertEqual(leader.message_str, "我想问\n顺便说一下")
+
+    async def test_commands_are_not_absorbed(self):
+        leader = Event("hello")
+        task = self.lead(leader)
+        await asyncio.sleep(0.01)
+        command = Event("/reset")
+        command.set_extra("handlers_parsed_params", {"reset": {}})
+        await self.plugin.on_follow_up(command)
+        self.assertFalse(command.stopped)
+        await task
+
+    async def test_absorbed_media_survives_follower_cleanup(self):
+        leader = Event("看这个")
+        task = self.lead(leader)
+        await asyncio.sleep(0.01)
+        follower = Event("", [picture("a")])
+        follower.files.append("/tmp/a.jpg")
+        await self.follow(follower)
+        await task
+        self.assertEqual((follower.files, leader.files), ([], ["/tmp/a.jpg"]))
+
+    async def run_reply(self):
+        """Release a leader, then hold its pipeline task open like a running LLM call."""
+        leader = Event("帮我写首诗")
+        req = types.SimpleNamespace(conversation="conv")
+        replying = asyncio.Event()
+
+        async def pipeline():
+            await self.plugin.on_waiting_llm_request(leader)
+            await self.plugin.on_llm_request(leader, req)
+            await replying.wait()
+
+        task = asyncio.create_task(pipeline())
+        while self.plugin.runs.get(self.plugin._key(leader)) is None:
+            await asyncio.sleep(0.01)
+        return leader, req, replying, task
+
+    async def test_cancel_aborts_reply_and_carries_text(self):
+        leader, req, replying, task = await self.run_reply()
+        newcomer = Event("关于秋天")
+        lead_task = await self.follow(newcomer)
+        self.assertTrue(leader.get_extra("agent_stop_requested"))
+        self.assertIsNone(req.conversation)  # aborted turn stays out of history
+        self.assertFalse(newcomer.stopped)
+        replying.set()
+        await asyncio.gather(task, lead_task)
+        self.assertEqual(newcomer.message_str, "帮我写首诗\n关于秋天")
+
+    async def test_cancel_disabled_leaves_reply_alone(self):
+        self.config["cancel_on_new_message"] = False
+        leader, req, replying, task = await self.run_reply()
+        newcomer = Event("关于秋天")
+        lead_task = await self.follow(newcomer)
+        replying.set()
+        await asyncio.gather(task, lead_task)
+        self.assertIsNone(leader.get_extra("agent_stop_requested"))
+        self.assertEqual(req.conversation, "conv")
+        self.assertEqual(newcomer.message_str, "关于秋天")
+
+    async def test_answered_or_finished_reply_is_not_cancelled(self):
+        leader, req, replying, task = await self.run_reply()
+        await self.plugin.on_llm_response(leader, None)
+        self.assertIsNone(self.plugin._follow_up_kind(Event("谢谢")))
+        replying.set()
+        await task
+        self.assertEqual(self.plugin.runs, {})
+
+    async def test_unload_releases_waiting_leader(self):
+        self.config["delay_seconds"] = 5
+        event = Event("hello")
+        task = self.lead(event)
+        await asyncio.sleep(0.01)
+        await self.plugin.terminate()
+        await asyncio.wait_for(task, 1)
+        self.assertFalse(event.stopped)
+
+    async def test_disabled_plugin_passes_through(self):
+        self.config["enabled"] = False
+        self.config["delay_seconds"] = 5
+        event = Event("hello")
+        await asyncio.wait_for(self.lead(event), 0.5)
+        self.assertEqual(self.plugin.bursts, {})
+
+
+class JevBackendTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.plugin = debounce.DebouncePlugin(
-            None, {"classifier_backend": "jev", "timeout_seconds": 0}
+            None, {"classifier_backend": "jev", "delay_seconds": 0}
         )
         await self.plugin._load_classifier_async()
 
     async def asyncTearDown(self):
         await self.plugin.terminate()
-
-    async def submit(self, text, message_id, images=None):
-        event = Event(text, message_id)
-        event.message_obj.message = images or []
-        request = types.SimpleNamespace(prompt=text, image_urls=[])
-        await self.plugin.on_waiting_llm_request(event)
-        await self.plugin.on_llm_request(event, request)
-        return event, request
 
     async def test_jev_loading_does_not_load_or_download_onnx(self):
         self.plugin.classifier = None
@@ -113,169 +387,36 @@ class JevDebounceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(self.plugin.classifier, debounce.JevSentenceClassifier)
         self.plugin._download_model_from_modelscope.assert_not_called()
 
-    async def test_incomplete_fragments_keep_merging_until_complete(self):
+    async def test_images_from_all_fragments_reach_judge(self):
+        first, second = picture("first"), picture("second")
         client = self.plugin.classifier.client
         client.evaluate = AsyncMock(
-            side_effect=[
-                {"complete": {"noul": 0.1}},
-                {"complete": {"noul": 0.2}},
-                {"complete": {"noul": 0.95}},
-            ]
+            side_effect=[{"complete": {"noul": 0.1}}, {"complete": {"noul": 0.99}}]
         )
-        first, _ = await self.submit("如果明天", "1")
-        second, _ = await self.submit("不下雨", "2")
-        third, request = await self.submit("我们去爬山吧", "3")
-        self.assertTrue(first.stopped)
-        self.assertTrue(second.stopped)
-        self.assertFalse(third.stopped)
-        self.assertEqual(request.prompt, "如果明天 不下雨 我们去爬山吧")
-        self.assertEqual(client.evaluate.await_count, 3)
-        self.assertFalse(
-            self.plugin.monitor_tasks
-        )  # timeout=0 disables automatic sending
-        state, questions = client.evaluate.call_args.args
-        self.assertEqual(state["message"], request.prompt)
-        self.assertEqual(questions["complete"]["type"], "noul")
-        await self.plugin.on_llm_response(
-            third, types.SimpleNamespace(completion_text="好")
+        leader = Event("比较这两张图", [first])
+        task = asyncio.create_task(self.plugin.on_waiting_llm_request(leader))
+        while not client.evaluate.await_count:
+            await asyncio.sleep(0.01)
+        follower = Event("有什么不同？", [second])
+        await self.plugin.on_follow_up(follower)
+        await task
+        self.assertEqual(client.evaluate.call_args.kwargs["images"], [first, second])
+        self.assertEqual(
+            client.evaluate.call_args.args[0]["message"], "比较这两张图\n有什么不同？"
         )
-        self.assertEqual(self.plugin.buffers["test"].messages, [])
-
-    async def test_failure_submits_all_buffered_messages(self):
-        self.plugin.classifier.client.evaluate = AsyncMock(
-            side_effect=[{"complete": {"noul": 0.1}}, ValueError("JEV unavailable")]
+        self.assertEqual(
+            [part.type for part in leader.message_obj.message],
+            ["Plain", "Image", "Image"],
         )
-        await self.submit("如果", "1")
-        event, request = await self.submit("下雨", "2")
-        self.assertFalse(event.stopped)
-        self.assertEqual(request.prompt, "如果 下雨")
-
-    async def test_new_message_during_remote_judgment_defers_old_request(self):
-        started = asyncio.Event()
-        release = asyncio.Event()
-
-        async def slow_judgment(_text):
-            started.set()
-            await release.wait()
-            return 0.99, 0.99
-
-        self.plugin.classifier.predict = slow_judgment
-        first_task = asyncio.create_task(self.submit("如果明天", "1"))
-        await started.wait()
-        second = Event("不下雨我们去爬山", "2")
-        await self.plugin.on_waiting_llm_request(second)
-        release.set()
-        first, _ = await first_task
-        self.assertTrue(first.stopped)
-        request = types.SimpleNamespace(prompt=second.message_str, image_urls=[])
-        await self.plugin.on_llm_request(second, request)
-        self.assertFalse(second.stopped)
-        self.assertEqual(request.prompt, "如果明天 不下雨我们去爬山")
-
-    async def test_cancelled_monitor_does_not_remove_replacement(self):
-        self.plugin.config["timeout_seconds"] = 10
-        self.plugin.classifier.predict = AsyncMock(return_value=(0.1, 0.1))
-        await self.submit("如果", "1")
-        old = self.plugin.monitor_tasks["test"]
-        await asyncio.sleep(0)
-        await self.submit("明天", "2")
-        new = self.plugin.monitor_tasks["test"]
-        self.assertIsNot(old, new)
-        await asyncio.gather(old, return_exceptions=True)
-        self.assertIs(self.plugin.monitor_tasks["test"], new)
 
     async def test_bad_probability_falls_back_to_submission(self):
         self.plugin.classifier.client.evaluate = AsyncMock(
             return_value={"complete": {"noul": True}}
         )
-        event, _ = await self.submit("hello", "1")
+        event = Event("hello")
+        await asyncio.wait_for(self.plugin.on_waiting_llm_request(event), 1)
         self.assertFalse(event.stopped)
 
-    async def test_pure_picture_is_judged_and_forwarded(self):
-        picture = types.SimpleNamespace(type="Image", file="base64://first")
-        client = self.plugin.classifier.client
-        client.evaluate = AsyncMock(return_value={"complete": {"noul": 0.99}})
-        event, request = await self.submit("", "1", [picture])
-        self.assertFalse(event.stopped)
-        self.assertEqual(request.image_urls, [picture.file])
-        self.assertEqual(client.evaluate.call_args.kwargs["images"], [picture])
 
-    async def test_images_from_all_fragments_reach_judge_and_reply(self):
-        first = types.SimpleNamespace(type="Image", file="base64://first")
-        second = types.SimpleNamespace(type="Image", file="base64://second")
-        client = self.plugin.classifier.client
-        client.evaluate = AsyncMock(
-            side_effect=[
-                {"complete": {"noul": 0.1}},
-                {"complete": {"noul": 0.1}},
-                {"complete": {"noul": 0.99}},
-            ]
-        )
-        await self.submit("比较这两张图", "1", [first])
-        await self.submit("", "2", [second])
-        event, request = await self.submit("有什么不同？", "3")
-        self.assertFalse(event.stopped)
-        self.assertEqual(request.prompt, "比较这两张图 有什么不同？")
-        self.assertEqual(request.image_urls, [first.file, second.file])
-        self.assertEqual(client.evaluate.call_args.kwargs["images"], [first, second])
-        await self.plugin.on_llm_response(
-            event, types.SimpleNamespace(completion_text="不同")
-        )
-        self.assertEqual(self.plugin.buffers["test"].images, [])
-        self.assertEqual(self.plugin.buffers["test"].image_urls, [])
-
-    async def test_picture_service_failure_preserves_images(self):
-        picture = types.SimpleNamespace(type="Image", file="base64://first")
-        self.plugin.classifier.client.evaluate = AsyncMock(
-            side_effect=ValueError("HTTP 400")
-        )
-        event, request = await self.submit("这张图是什么？", "1", [picture])
-        self.assertFalse(event.stopped)
-        self.assertEqual(request.image_urls, [picture.file])
-
-    async def test_timeout_keeps_earlier_pictures_when_last_event_is_text(self):
-        picture = types.SimpleNamespace(type="Image", file="base64://first")
-        self.plugin.classifier.client.evaluate = AsyncMock(
-            return_value={"complete": {"noul": 0.1}}
-        )
-        await self.submit("看这张图", "1", [picture])
-        await self.submit("我想知道", "2")
-        self.plugin._send_fake_event = AsyncMock()
-        await self.plugin._monitor_session("test", 0)
-        self.assertEqual(
-            self.plugin._send_fake_event.call_args.kwargs["images"], [picture]
-        )
-
-    async def test_failed_replay_keeps_text_and_pictures_buffered(self):
-        picture = types.SimpleNamespace(type="Image", file="base64://first")
-        self.plugin.classifier.client.evaluate = AsyncMock(
-            return_value={"complete": {"noul": 0.1}}
-        )
-        await self.submit("看这张图", "1", [picture])
-        self.plugin._send_fake_event = AsyncMock(return_value=False)
-        await self.plugin._monitor_session("test", 0)
-        self.assertEqual(self.plugin.buffers["test"].images, [picture])
-        self.assertEqual(self.plugin.buffers["test"].get_full_text(), "看这张图")
-        self.assertIn("test", self.plugin.waiting_sessions)
-
-    async def test_disabled_plugin_does_not_call_jev(self):
-        self.plugin.config["enabled"] = False
-        self.plugin.classifier.predict = AsyncMock()
-        await self.submit("hello", "1")
-        self.plugin.classifier.predict.assert_not_awaited()
-
-    async def test_timeout_flushes_and_unload_cancels_monitors(self):
-        self.plugin.config["timeout_seconds"] = 10
-        self.plugin.classifier.predict = AsyncMock(return_value=(0.1, 0.1))
-        await self.submit("如果", "1")
-        task = self.plugin.monitor_tasks["test"]
-        self.plugin._send_fake_event = AsyncMock()
-        await self.plugin._monitor_session("test", 0)
-        self.plugin._send_fake_event.assert_awaited_once()
-        # The manual monitor is only used to exercise timeout behavior.
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        await self.submit("然后", "2")
-        active = list(self.plugin.monitor_tasks.values())
-        await self.plugin.terminate()
-        self.assertTrue(all(task.done() for task in active))
+if __name__ == "__main__":
+    unittest.main()
