@@ -228,7 +228,7 @@ class DebouncePlugin(Star):
             return number(answers["complete"].get("noul"), 0, 1)
         except Exception as exc:
             # Submit the buffered messages on service failure instead of losing them.
-            logger.warning(f"防抖判断失败（{type(exc).__name__}），提交已缓存消息")
+            logger.warning(f"防抖判断失败（{type(exc).__name__}: {exc}），提交已缓存消息")
             return 1.0
 
     async def _wait(self, burst: Burst, event: AstrMessageEvent) -> bool:
