@@ -4,8 +4,8 @@
 > 
 <div align="center">
 
-[![GitHub stars](https://img.shields.io/github/stars/advent259141/astrbot_plugin_debounce?style=flat-square)](https://github.com/yourusername/astrbot_plugin_debounce)
-[![GitHub license](https://img.shields.io/github/license/advent259141/astrbot_plugin_debounce?style=flat-square)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/Type-32/astrbot-decision-delay-debouncer?style=flat-square)](https://github.com/Type-32/astrbot-decision-delay-debouncer)
+[![GitHub license](https://img.shields.io/github/license/Type-32/astrbot-decision-delay-debouncer?style=flat-square)](LICENSE)
 [![AstrBot](https://img.shields.io/badge/AstrBot-v4.29.1+-blue?style=flat-square)](https://github.com/AstrBotdevs/AstrBot)
 
 **按阅读时间等待连续消息，再判断用户是否说完，合并后只调用一次 LLM**
@@ -62,7 +62,7 @@
 
 ```bash
 cd AstrBot/data/plugins
-git clone https://github.com/yourusername/astrbot_plugin_debounce.git
+git clone https://github.com/Type-32/astrbot-decision-delay-debouncer.git
 ```
 
 然后在 AstrBot WebUI 中重载插件列表。
