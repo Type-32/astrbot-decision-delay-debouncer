@@ -128,7 +128,7 @@ git clone https://github.com/Type-32/astrbot-decision-delay-debouncer.git
 
 1. 在 [openrouter.ai/keys](https://openrouter.ai/keys) 创建密钥；
 2. 填入 `jev_api_key`（或设置 AstrBot 进程的环境变量 `OPENROUTER_API_KEY`，配置优先）；
-3. 重载插件。其余默认值即可用：
+3. 重载插件，管理员发送 `/debounce_test` 确认连通。其余默认值即可用：
 
 ```json
 {
@@ -144,6 +144,7 @@ git clone https://github.com/Type-32/astrbot-decision-delay-debouncer.git
 插件调用 OpenRouter 的 [System One 接口](https://openrouter.ai/docs/api/api-reference/systemone/submit-a-system-one-request)，
 用 [JEV](https://openrouter.ai/docs/guides/community/jev) 的 `noul` 问题获取“用户是否已表达完整”的概率，与 `send_threshold` 比较。
 `jev-latest` 会映射到最新的 `typesafe/jev-*`；也可固定版本，如 `typesafe/jev-1.14`。
+OpenRouter 网页链接中的 `~typesafe/...` 前缀 `~` 会被自动去掉。
 
 未配置密钥、超时、HTTP 错误或返回值非法时，直接提交已合并的消息，不会丢失或卡住；
 未配置密钥时插件只按阅读延迟合并。`max_wait_seconds` 是等待用户后续消息的上限，
@@ -219,6 +220,21 @@ LLM:  虽然今天很累，但还是要注意休息哦！
 [Debounce] 合并发送: 如果明天不下雨
 我们去爬山吧
 ```
+
+### 测试判断接口
+
+管理员在聊天中发送 `/debounce_test`，插件会用当前配置发起一次真实判断（计费一次），回复结果、接口地址、模型与耗时。
+WebUI 插件配置页不支持自定义按钮，因此用指令代替。
+
+判断失败时日志为 `防抖判断失败（ValueError: JEV HTTP <状态码>: <原因>）`，原因取自 OpenRouter 返回的错误信息：
+
+| 状态码 | 常见原因 |
+|--------|----------|
+| 401 | 密钥无效、被禁用或复制不完整 |
+| 402 | 账户或该密钥额度不足 |
+| 403 | 密钥自身的消费上限已用完、组织 Guardrail 预算/模型白名单拦截，或内容审核拦截 |
+| 404 / 400 | 模型名或地址错误 |
+| 429 / 5xx | 限流或服务暂时不可用 |
 
 ---
 

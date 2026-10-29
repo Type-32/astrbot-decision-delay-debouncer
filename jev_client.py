@@ -47,6 +47,19 @@ def number(value, minimum: float, maximum: float) -> float:
     return result
 
 
+async def _error_reason(response, secret: str = "") -> str:
+    """`: <error.message>` from an OpenRouter/TypeSafe error body, or ''."""
+    try:
+        body = await response.json(content_type=None)
+        message = body["error"]["message"]
+    except Exception:
+        return ""
+    if not isinstance(message, str) or (secret and secret in message):
+        return ""  # never echo credentials into logs or chat
+    message = " ".join(message.split())
+    return f": {message[:200]}" if message else ""
+
+
 class JevClient:
     def __init__(self, config):
         base_url = (
@@ -64,8 +77,11 @@ class JevClient:
             str(config.get("jev_api_key", "") or "").strip()
             or os.getenv(env_key, "").strip()
         )
-        # OpenRouter maps bare System One IDs such as jev-latest onto typesafe/.
-        self.model = str(config.get("jev_model", "") or "jev-latest").strip()
+        # OpenRouter maps bare System One IDs such as jev-latest onto typesafe/;
+        # its website shows "~typesafe/..." links, which are not API model IDs.
+        self.model = (
+            str(config.get("jev_model", "") or "jev-latest").strip().lstrip("~")
+        )
         self.enable_images = bool(config.get("jev_enable_images", True))
         try:
             self.max_images = max(1, min(8, int(config.get("jev_max_images", 4))))
@@ -148,8 +164,10 @@ class JevClient:
                     allow_redirects=False,
                 ) as response:
                     if response.status != 200:
-                        # Error bodies/URLs can contain credentials or user messages.
-                        raise ValueError(f"JEV HTTP {response.status}")
+                        raise ValueError(
+                            f"JEV HTTP {response.status}"
+                            + await _error_reason(response, self.api_key)
+                        )
                     try:
                         data = await response.json()
                     except (ValueError, aiohttp.ContentTypeError) as exc:

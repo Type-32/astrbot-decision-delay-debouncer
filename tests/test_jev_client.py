@@ -92,6 +92,19 @@ class JevHTTPTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "invalid JSON"):
             await self.client.evaluate("x", self.questions)
 
+    async def test_error_reason_is_surfaced_without_secrets(self):
+        self.status = 403
+        self.data = {"error": {"code": 403, "message": "Key limit exceeded"}}
+        with self.assertRaisesRegex(ValueError, "^JEV HTTP 403: Key limit exceeded$"):
+            await self.client.evaluate("x", self.questions)
+        self.data = {"error": {"message": "bad key test-only-key"}}
+        with self.assertRaisesRegex(ValueError, "^JEV HTTP 403$"):
+            await self.client.evaluate("x", self.questions)
+
+    def test_website_model_slug_is_accepted(self):
+        client = jev.JevClient({"jev_model": "~typesafe/jev-latest"})
+        self.assertEqual(client.model, "typesafe/jev-latest")
+
     async def test_timeout(self):
         self.client.timeout = 0.01
         self.delay = 0.03

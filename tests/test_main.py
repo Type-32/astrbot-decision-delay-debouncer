@@ -41,6 +41,7 @@ def load_plugin():
 
     event.filter = types.SimpleNamespace(
         CustomFilter=CustomFilter,
+        PermissionType=types.SimpleNamespace(ADMIN="admin"),
         **{
             name: lambda *_a, **_k: lambda func: func
             for name in [
@@ -49,6 +50,8 @@ def load_plugin():
                 "on_llm_request",
                 "on_llm_response",
                 "custom_filter",
+                "command",
+                "permission_type",
             ]
         },
     )
@@ -402,6 +405,20 @@ class JevJudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(event.stopped)
         plugin.jev.evaluate.assert_not_awaited()
         await plugin.terminate()
+
+    async def command_reply(self):
+        event = Event("/debounce_test")
+        event.plain_result = lambda text: text
+        return [reply async for reply in self.plugin.debounce_test(event)][0]
+
+    async def test_connection_test_reports_success_and_failure(self):
+        self.evaluate.return_value = {"complete": {"type": "noul", "noul": 0.97}}
+        self.assertIn("✅ 连接正常，完整概率 0.97", await self.command_reply())
+        self.evaluate.side_effect = ValueError("JEV HTTP 403: Key limit exceeded")
+        reply = await self.command_reply()
+        self.assertIn("❌ 失败：ValueError: JEV HTTP 403: Key limit exceeded", reply)
+        self.assertIn("https://openrouter.ai/api/v1/systemone", reply)
+        self.assertNotIn("test-only-key", reply)
 
 
 if __name__ == "__main__":

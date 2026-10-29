@@ -292,6 +292,32 @@ class DebouncePlugin(Star):
             lambda _: self.runs.pop(key) if self.runs.get(key) is run else None
         )
 
+    # ---------- commands ----------
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("debounce_test")
+    async def debounce_test(self, event: AstrMessageEvent):
+        """测试 JEV 判断接口连通性（管理员）"""
+        jev = self.jev
+        if jev is None:
+            yield event.plain_result("消息防抖：classifier_backend 为 none，不调用 JEV")
+            return
+        if not jev.api_key:
+            yield event.plain_result("消息防抖：未配置 jev_api_key（修改后需重载插件）")
+            return
+        started = time.monotonic()
+        try:
+            answers = await jev.evaluate({"message": "你好，在吗？"}, COMPLETE_QUESTION)
+            score = number(answers["complete"].get("noul"), 0, 1)
+        except Exception as exc:
+            result = f"❌ 失败：{type(exc).__name__}: {exc}"
+        else:
+            result = f"✅ 连接正常，完整概率 {score:.2f}"
+        elapsed = time.monotonic() - started
+        yield event.plain_result(
+            f"{result}\n地址：{jev.endpoint}\n模型：{jev.model}\n耗时：{elapsed:.1f}s"
+        )
+
     # ---------- hooks ----------
 
     # Lowest priority: other plugins' handlers for the same message run first.
